@@ -23,6 +23,22 @@
 
 extern int qwen_tts_verbose;
 
+static inline float st_dot(const float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    return cblas_sdot(n, a, 1, b, 1);
+#else
+    return kernel_dot(a, b, n);
+#endif
+}
+
+static inline void st_axpy(int n, float alpha, const float *x, float *y) {
+#ifdef USE_BLAS
+    cblas_saxpy(n, alpha, x, 1, y, 1);
+#else
+    for (int i = 0; i < n; i++) y[i] += alpha * x[i];
+#endif
+}
+
 /* ========================================================================
  * RoPE cache computation
  * ======================================================================== */
@@ -617,20 +633,15 @@ void qwen_tts_subtalker_generate(
                 float *_o = attn_out + h * st_head_dim; \
                 float *_scores = ctx->st_scores; \
                 memset(_o, 0, st_head_dim * sizeof(float)); \
-                float _max = -1e30f; \
                 for (int t = 0; t <= (pos_idx); t++) { \
                     float *_k = ctx->subtalker_kv_k + sl * kv_stride + t * st_kv_dim + kvh * st_head_dim; \
-                    float sc = 0; \
-                    for (int d = 0; d < st_head_dim; d++) sc += _q[d] * _k[d]; \
-                    sc *= attn_scale; _scores[t] = sc; if (sc > _max) _max = sc; \
+                    _scores[t] = st_dot(_q, _k, st_head_dim) * attn_scale; \
                 } \
-                float _sum = 0; \
-                for (int t = 0; t <= (pos_idx); t++) { _scores[t] = expf(_scores[t] - _max); _sum += _scores[t]; } \
-                float _inv = 1.0f / _sum; \
+                kernel_softmax(_scores, (pos_idx) + 1); \
                 for (int t = 0; t <= (pos_idx); t++) { \
-                    float w = _scores[t] * _inv; \
+                    float w = _scores[t]; \
                     float *_v = ctx->subtalker_kv_v + sl * kv_stride + t * st_kv_dim + kvh * st_head_dim; \
-                    for (int d = 0; d < st_head_dim; d++) _o[d] += w * _v[d]; \
+                    st_axpy(st_head_dim, w, _v, _o); \
                 } \
             } \
             kernel_matvec_bf16(x_norm, l->wo_bf16, attn_out, st_hidden, st_heads * st_head_dim); \

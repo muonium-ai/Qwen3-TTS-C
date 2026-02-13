@@ -18,7 +18,7 @@ Generates natural 24kHz speech from text using a two-stage architecture (Talker 
 Text → [BPE Tokenizer] → Token IDs
                               ↓
                     ┌─────────────────┐
-                    │   Talker LM     │  20-layer transformer (M-RoPE, GQA, QK-Norm)
+                    │   Talker LM     │  config-driven transformer (M-RoPE, GQA, QK-Norm)
                     │   + Sub-Talker  │  5-layer code predictor (31 codebook groups)
                     └────────┬────────┘
                              ↓
@@ -162,7 +162,8 @@ Makefile                  Build system
 
 ## Technical Details
 
-- **Talker**: 20-layer GQA transformer (16 Q-heads, 2 KV-heads, head_dim=64), M-RoPE, QK-Norm, SwiGLU MLP
+- **Talker**: Config-driven GQA transformer, M-RoPE, QK-Norm, SwiGLU MLP
+- **Qwen3-TTS 0.6B CustomVoice config**: 28 layers, 16 Q-heads, 8 KV-heads, head_dim=128
 - **Sub-Talker**: 5-layer code predictor generating 31 additional codebook groups per step
 - **Codec Decoder**: SplitRVQ (16 codebooks × 2048 entries) → 8-layer sliding-window transformer (window=72) → ConvNeXt upsampler → BigVGAN vocoder
 - **Weights**: BF16 mmap for talker/sub-talker (zero-copy), F32 copies for codec decoder
@@ -171,6 +172,24 @@ Makefile                  Build system
 ## Performance
 
 On Apple M-series Macs with Accelerate, expect roughly real-time generation. The bottleneck is the autoregressive talker loop; codec decoding is fast.
+
+## Benchmark Notes
+
+- Use equal-work comparisons. Compare `ms/token` or runs that produce similar audio duration, not just wall-clock.
+- If C does not sample EOS early, it can run until `--max-tokens`, producing much longer audio and making speed comparisons misleading.
+- `make benchmark` currently uses `BENCH_MAX_TOKENS=512`, so C may generate up to `40.96s` audio (`512 * 0.08s`) while Python may stop earlier.
+- For quick parity checks, start with:
+
+```bash
+make benchmark BENCH_RUNS=1 BENCH_WARMUP=0 BENCH_MAX_TOKENS=128
+```
+
+## Known Issues
+
+- Talker attention shape handling is under active work.
+- The model config defines explicit `head_dim=128`.
+- Some C paths still derive talker head dim as `hidden/heads`, which can cause incorrect attention math, poor EOS behavior, and inflated generation length.
+- Until this is fixed, prioritize normalized metrics (`ms/token`, `ms/audio_sec`) over raw total runtime.
 
 ## Credits
 
