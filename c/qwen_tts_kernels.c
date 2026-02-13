@@ -12,6 +12,10 @@
 #include <string.h>
 #include <float.h>
 
+#ifdef USE_OPENMP
+#include <omp.h>
+#endif
+
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -233,6 +237,9 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
      *   alpha = exp(alpha_log)
      *   beta = 1 / (exp(beta_log) + eps)
      */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int c = 0; c < channels; c++) {
         float a = alpha[c];
         float inv_b = beta[c];
@@ -607,6 +614,9 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
     if (kernel_size == 1 && dilation == 1) {
         if (groups == in_channels && in_channels == out_channels) {
             /* Depthwise pointwise: one scalar multiply per sample. */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
             for (int c = 0; c < in_channels; c++) {
                 float w = weight[c];
                 float b = bias ? bias[c] : 0.0f;
@@ -642,6 +652,9 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
         }
 #endif
 
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int oc = 0; oc < out_channels; oc++) {
             int g = oc / out_per_group;
             const float *w_row = weight + (size_t)oc * ch_per_group;
@@ -662,6 +675,9 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
      * avoid inner-boundary checks for the steady-state region.
      */
     if (dilation == 1) {
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
         for (int oc = 0; oc < out_channels; oc++) {
             int g = oc / out_per_group;
             int ic_base = g * ch_per_group;
@@ -693,6 +709,9 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
         return;
     }
 
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int oc = 0; oc < out_channels; oc++) {
         int g = oc / out_per_group;
         int ic_base = g * ch_per_group;
@@ -754,6 +773,9 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
      *   iterate output channel first so writes stay contiguous in out[oc, :].
      * Weight layout is [in_channels, out_channels, kernel_size].
      */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
     for (int oc = 0; oc < out_channels; oc++) {
         float *out_ch = out + (size_t)oc * final_len;
         float b = bias ? bias[oc] : 0.0f;

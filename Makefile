@@ -46,6 +46,7 @@ TOKENIZER_PATH   ?= $(PYTHON_MODEL)
 
 # ---- Platform detection ----
 UNAME_S := $(shell uname -s)
+OPENMP ?= 1
 
 ifeq ($(UNAME_S),Darwin)
   # macOS: use Accelerate framework for BLAS
@@ -67,6 +68,33 @@ else ifeq ($(UNAME_S),Linux)
       LDFLAGS += -L/usr/local/lib -lopenblas
     else
       $(warning OpenBLAS not found — building without BLAS. Performance will be poor.)
+    endif
+  endif
+endif
+
+ifeq ($(OPENMP),1)
+  ifeq ($(UNAME_S),Darwin)
+    LIBOMP_CFLAGS := $(shell pkg-config --cflags libomp 2>/dev/null)
+    LIBOMP_LIBS := $(shell pkg-config --libs libomp 2>/dev/null)
+    ifneq ($(strip $(LIBOMP_LIBS)),)
+      CFLAGS  += -DUSE_OPENMP -Xpreprocessor -fopenmp $(LIBOMP_CFLAGS)
+      LDFLAGS += $(LIBOMP_LIBS)
+    else ifneq ($(wildcard /opt/homebrew/opt/libomp/include/omp.h),)
+      CFLAGS  += -DUSE_OPENMP -Xpreprocessor -fopenmp -I/opt/homebrew/opt/libomp/include
+      LDFLAGS += -L/opt/homebrew/opt/libomp/lib -lomp
+    else ifneq ($(wildcard /usr/local/opt/libomp/include/omp.h),)
+      CFLAGS  += -DUSE_OPENMP -Xpreprocessor -fopenmp -I/usr/local/opt/libomp/include
+      LDFLAGS += -L/usr/local/opt/libomp/lib -lomp
+    else
+      $(warning libomp not found -- building without OpenMP.)
+    endif
+  else
+    OPENMP_CHECK := $(shell $(CC) -fopenmp -dM -E - </dev/null >/dev/null 2>&1 && echo yes)
+    ifeq ($(OPENMP_CHECK),yes)
+      CFLAGS  += -DUSE_OPENMP -fopenmp
+      LDFLAGS += -fopenmp
+    else
+      $(warning OpenMP not supported by compiler -- building without OpenMP.)
     endif
   endif
 endif
