@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import wave
+from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -38,6 +39,29 @@ class RunResult:
     audio_sec: float
     rtf: float
     internal_total_ms: float | None = None
+    codec_tokens: int | None = None
+    stop_reason: str | None = None
+    stop_step: int | None = None
+    ms_per_token: float | None = None
+    tokens_per_s: float | None = None
+    ms_per_audio_sec: float | None = None
+
+
+def _safe_div(num: float, den: float) -> float | None:
+    if den == 0:
+        return None
+    return num / den
+
+
+def _finalize_run_metrics(rr: RunResult) -> RunResult:
+    if rr.codec_tokens is not None and rr.codec_tokens > 0:
+        rr.ms_per_token = rr.elapsed_ms / float(rr.codec_tokens)
+        rr.tokens_per_s = float(rr.codec_tokens) / (rr.elapsed_ms / 1000.0) if rr.elapsed_ms > 0 else None
+
+    if rr.audio_sec > 0:
+        rr.ms_per_audio_sec = rr.elapsed_ms / rr.audio_sec
+
+    return rr
 
 
 def _write_wav_mono_16bit(path: Path, samples: np.ndarray, sample_rate: int) -> None:
@@ -78,14 +102,10 @@ def _chat_template(text: str) -> str:
 
 
 def _parse_c_internal_total_ms(stderr: str) -> float | None:
-    # Prefer the summary line printed by main.c with verbose mode:
-    #   Total:   1234.5 ms
     match = re.search(r"^\s*Total:\s+([0-9]+(?:\.[0-9]+)?)\s*ms\s*$", stderr, re.MULTILINE)
     if match:
         return float(match.group(1))
 
-    # Fallback to the generation line in qwen_tts.c:
-    #   Total: 1234.5 ms (X.XX s audio, Y.YYx realtime)
     match = re.search(r"Total:\s+([0-9]+(?:\.[0-9]+)?)\s*ms\s*\(", stderr)
     if match:
         return float(match.group(1))
@@ -93,7 +113,32 @@ def _parse_c_internal_total_ms(stderr: str) -> float | None:
     return None
 
 
-def _summary(values: list[float]) -> dict[str, float]:
+def _parse_c_generated_tokens(stderr: str) -> int | None:
+    match = re.search(r"Generated\s+(\d+)\s+codec tokens", stderr)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _parse_c_stop(stderr: str, max_new_tokens: int, generated_tokens: int | None) -> tuple[str | None, int | None]:
+    match = re.search(r"Stop:\s+([a-z_]+)\s+at step\s+(\d+)", stderr)
+    if match:
+        return match.group(1), int(match.group(2))
+
+    eos_match = re.search(r"EOS at step\s+(\d+)", stderr)
+    if eos_match:
+        step = int(eos_match.group(1))
+        return "eos", step
+
+    if generated_tokens is not None:
+        if generated_tokens >= max_new_tokens:
+            return "max_tokens", max_new_tokens
+        return "eos", generated_tokens
+
+    return None, None
+
+
+def _summary_ms(values: list[float]) -> dict[str, float]:
     return {
         "mean_ms": statistics.fmean(values),
         "median_ms": statistics.median(values),
@@ -102,7 +147,71 @@ def _summary(values: list[float]) -> dict[str, float]:
     }
 
 
-def _bench_python(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str, Any], str, float]:
+def _summary_scalar(values: list[float]) -> dict[str, float]:
+    return {
+        "mean": statistics.fmean(values),
+        "median": statistics.median(values),
+        "min": min(values),
+        "max": max(values),
+    }
+
+
+def _collect_entity_summary(results: list[RunResult], *, load_ms: float | None = None, speaker: str | None = None) -> dict[str, Any]:
+    elapsed_values = [x.elapsed_ms for x in results]
+    rtf_values = [x.rtf for x in results]
+    audio_values = [x.audio_sec for x in results]
+
+    codec_tokens_values = [float(x.codec_tokens) for x in results if x.codec_tokens is not None]
+    stop_steps = [float(x.stop_step) for x in results if x.stop_step is not None]
+    ms_per_token_values = [x.ms_per_token for x in results if x.ms_per_token is not None]
+    tokens_per_s_values = [x.tokens_per_s for x in results if x.tokens_per_s is not None]
+    ms_per_audio_sec_values = [x.ms_per_audio_sec for x in results if x.ms_per_audio_sec is not None]
+
+    stop_reason_counts = Counter(x.stop_reason for x in results if x.stop_reason)
+
+    summary: dict[str, Any] = {
+        "runs": [asdict(x) for x in results],
+        "timing": _summary_ms(elapsed_values),
+        "rtf": {
+            "mean": statistics.fmean(rtf_values),
+            "median": statistics.median(rtf_values),
+        },
+        "audio_sec": {
+            "mean": statistics.fmean(audio_values),
+            "median": statistics.median(audio_values),
+        },
+    }
+
+    if load_ms is not None:
+        summary["load_ms"] = load_ms
+    if speaker is not None:
+        summary["speaker"] = speaker
+
+    if codec_tokens_values:
+        summary["codec_tokens"] = _summary_scalar(codec_tokens_values)
+    if stop_steps:
+        summary["stop_step"] = _summary_scalar(stop_steps)
+    if stop_reason_counts:
+        summary["stop_reason_counts"] = dict(stop_reason_counts)
+
+    normalized: dict[str, Any] = {}
+    if ms_per_token_values:
+        normalized["ms_per_token"] = _summary_scalar(ms_per_token_values)
+    if tokens_per_s_values:
+        normalized["tokens_per_s"] = _summary_scalar(tokens_per_s_values)
+    if ms_per_audio_sec_values:
+        normalized["ms_per_audio_sec"] = _summary_scalar(ms_per_audio_sec_values)
+    if normalized:
+        summary["normalized"] = normalized
+
+    return summary
+
+
+def _bench_python(
+    args: argparse.Namespace,
+    out_dir: Path,
+    max_new_tokens_effective: int,
+) -> tuple[dict[str, Any], str, float]:
     model_kwargs: dict[str, Any] = {
         "device_map": args.python_device,
         "dtype": _resolve_dtype(args.python_dtype),
@@ -127,34 +236,59 @@ def _bench_python(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str, An
             raise RuntimeError("No supported speakers returned by Python model; pass --speaker explicitly.")
         speaker = supported[0]
 
+    input_ids = model._tokenize_texts([model._build_assistant_text(args.text)])
+    gen_kwargs = model._merge_generate_kwargs(
+        do_sample=True,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        temperature=args.temperature,
+        repetition_penalty=args.repetition_penalty,
+        subtalker_dosample=True,
+        subtalker_top_k=args.subtalker_top_k,
+        subtalker_top_p=args.subtalker_top_p,
+        subtalker_temperature=args.subtalker_temperature,
+        max_new_tokens=max_new_tokens_effective,
+    )
+
     def run_once(save_path: Path | None) -> RunResult:
         _sync_if_cuda(args.python_device)
         start = time.perf_counter()
-        wavs, sr = model.generate_custom_voice(
-            text=args.text,
-            language=args.language,
-            speaker=speaker,
-            do_sample=True,
-            top_k=args.top_k,
-            top_p=args.top_p,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-            subtalker_dosample=True,
-            subtalker_top_k=args.subtalker_top_k,
-            subtalker_top_p=args.subtalker_top_p,
-            subtalker_temperature=args.subtalker_temperature,
-            max_new_tokens=args.max_new_tokens,
+
+        talker_codes_list, _ = model.model.generate(
+            input_ids=input_ids,
+            instruct_ids=[None],
+            languages=[args.language],
+            speakers=[speaker],
+            non_streaming_mode=True,
+            **gen_kwargs,
         )
+        wavs, sr = model.model.speech_tokenizer.decode([{"audio_codes": c} for c in talker_codes_list])
+
         _sync_if_cuda(args.python_device)
         elapsed_ms = (time.perf_counter() - start) * 1000.0
 
-        audio_sec = float(len(wavs[0])) / float(sr)
+        audio = np.asarray(wavs[0])
+        audio_sec = float(len(audio)) / float(sr)
         rtf = audio_sec / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
 
-        if save_path is not None:
-            _write_wav_mono_16bit(save_path, np.asarray(wavs[0]), int(sr))
+        codes = talker_codes_list[0]
+        codec_tokens = int(codes.shape[0])
+        stop_reason = "max_tokens" if codec_tokens >= max_new_tokens_effective else "eos"
+        stop_step = codec_tokens
 
-        return RunResult(elapsed_ms=elapsed_ms, audio_sec=audio_sec, rtf=rtf)
+        if save_path is not None:
+            _write_wav_mono_16bit(save_path, audio, int(sr))
+
+        return _finalize_run_metrics(
+            RunResult(
+                elapsed_ms=elapsed_ms,
+                audio_sec=audio_sec,
+                rtf=rtf,
+                codec_tokens=codec_tokens,
+                stop_reason=stop_reason,
+                stop_step=stop_step,
+            )
+        )
 
     for i in range(args.warmup_runs):
         run_once(None)
@@ -165,31 +299,16 @@ def _bench_python(args: argparse.Namespace, out_dir: Path) -> tuple[dict[str, An
         save_path = out_dir / "python_output.wav" if i == args.runs - 1 else None
         rr = run_once(save_path)
         results.append(rr)
+        tok_str = f", tokens={rr.codec_tokens}" if rr.codec_tokens is not None else ""
+        stop_str = f", stop={rr.stop_reason}" if rr.stop_reason else ""
         print(
             f"[python] run {i + 1}/{args.runs}: {rr.elapsed_ms:.2f} ms, "
-            f"audio={rr.audio_sec:.3f}s, rtf={rr.rtf:.3f}x",
+            f"audio={rr.audio_sec:.3f}s, rtf={rr.rtf:.3f}x{tok_str}{stop_str}",
             flush=True,
         )
 
-    elapsed_values = [x.elapsed_ms for x in results]
-    rtf_values = [x.rtf for x in results]
-    audio_values = [x.audio_sec for x in results]
-
-    summary: dict[str, Any] = {
-        "load_ms": load_ms,
-        "speaker": speaker,
-        "runs": [asdict(x) for x in results],
-        "timing": _summary(elapsed_values),
-        "rtf": {
-            "mean": statistics.fmean(rtf_values),
-            "median": statistics.median(rtf_values),
-        },
-        "audio_sec": {
-            "mean": statistics.fmean(audio_values),
-            "median": statistics.median(audio_values),
-        },
-    }
-    return summary, speaker, statistics.median(elapsed_values)
+    summary = _collect_entity_summary(results, load_ms=load_ms, speaker=speaker)
+    return summary, speaker, statistics.median([x.elapsed_ms for x in results])
 
 
 def _bench_c(
@@ -197,6 +316,7 @@ def _bench_c(
     out_dir: Path,
     token_ids: str,
     speaker: str,
+    max_new_tokens_effective: int,
 ) -> tuple[dict[str, Any], float]:
     c_bin = Path(args.c_bin).resolve()
     if not c_bin.exists():
@@ -237,8 +357,10 @@ def _bench_c(
             str(args.subtalker_temperature),
             "--subtalker-top-k",
             str(args.subtalker_top_k),
+            "--subtalker-top-p",
+            str(args.subtalker_top_p),
             "--max-tokens",
-            str(args.max_new_tokens),
+            str(max_new_tokens_effective),
         ]
 
         start = time.perf_counter()
@@ -249,6 +371,8 @@ def _bench_c(
         rtf = audio_sec / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
 
         internal_ms = _parse_c_internal_total_ms(proc.stderr)
+        codec_tokens = _parse_c_generated_tokens(proc.stderr)
+        stop_reason, stop_step = _parse_c_stop(proc.stderr, max_new_tokens_effective, codec_tokens)
 
         if tmp_wav_path is not None:
             try:
@@ -256,11 +380,16 @@ def _bench_c(
             except FileNotFoundError:
                 pass
 
-        return RunResult(
-            elapsed_ms=elapsed_ms,
-            audio_sec=audio_sec,
-            rtf=rtf,
-            internal_total_ms=internal_ms,
+        return _finalize_run_metrics(
+            RunResult(
+                elapsed_ms=elapsed_ms,
+                audio_sec=audio_sec,
+                rtf=rtf,
+                internal_total_ms=internal_ms,
+                codec_tokens=codec_tokens,
+                stop_reason=stop_reason,
+                stop_step=stop_step,
+            )
         )
 
     for i in range(args.warmup_runs):
@@ -273,35 +402,22 @@ def _bench_c(
         rr = run_once(save_path)
         results.append(rr)
         internal_str = f", internal={rr.internal_total_ms:.2f} ms" if rr.internal_total_ms is not None else ""
+        tok_str = f", tokens={rr.codec_tokens}" if rr.codec_tokens is not None else ""
+        stop_str = f", stop={rr.stop_reason}" if rr.stop_reason else ""
         print(
             f"[c] run {i + 1}/{args.runs}: {rr.elapsed_ms:.2f} ms{internal_str}, "
-            f"audio={rr.audio_sec:.3f}s, rtf={rr.rtf:.3f}x",
+            f"audio={rr.audio_sec:.3f}s, rtf={rr.rtf:.3f}x{tok_str}{stop_str}",
             flush=True,
         )
 
-    elapsed_values = [x.elapsed_ms for x in results]
-    rtf_values = [x.rtf for x in results]
-    audio_values = [x.audio_sec for x in results]
+    summary = _collect_entity_summary(results)
+
     internal_values = [x.internal_total_ms for x in results if x.internal_total_ms is not None]
-
-    summary: dict[str, Any] = {
-        "runs": [asdict(x) for x in results],
-        "timing": _summary(elapsed_values),
-        "rtf": {
-            "mean": statistics.fmean(rtf_values),
-            "median": statistics.median(rtf_values),
-        },
-        "audio_sec": {
-            "mean": statistics.fmean(audio_values),
-            "median": statistics.median(audio_values),
-        },
-    }
-
     if internal_values:
-        summary["internal_timing"] = _summary(internal_values)
+        summary["internal_timing"] = _summary_ms(internal_values)
         summary["internal_timing"]["count"] = len(internal_values)
 
-    return summary, statistics.median(elapsed_values)
+    return summary, statistics.median([x.elapsed_ms for x in results])
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,8 +448,42 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--subtalker-top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=512)
 
+    parser.add_argument(
+        "--equal-token-budget",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, overrides --max-new-tokens for both Python and C with a fixed token budget "
+            "to make comparisons more apples-to-apples."
+        ),
+    )
+
+    parser.add_argument(
+        "--gate-max-c-over-python-ms-per-token",
+        type=float,
+        default=0.0,
+        help="Fail (exit 1) if c/python median ms_per_token ratio exceeds this value (0 disables gate).",
+    )
+    parser.add_argument(
+        "--gate-max-c-over-python-ms-per-audio-sec",
+        type=float,
+        default=0.0,
+        help="Fail (exit 1) if c/python median ms_per_audio_sec ratio exceeds this value (0 disables gate).",
+    )
+
     parser.add_argument("--output-dir", default="benchmark_output")
     return parser.parse_args()
+
+
+def _extract_median(summary: dict[str, Any], path: tuple[str, ...]) -> float | None:
+    cur: Any = summary
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    if isinstance(cur, (float, int)):
+        return float(cur)
+    return None
 
 
 def main() -> int:
@@ -356,6 +506,10 @@ def main() -> int:
 
     if args.warmup_runs < 0 or args.runs <= 0:
         raise ValueError("warmup-runs must be >= 0 and runs must be > 0")
+    if args.equal_token_budget < 0:
+        raise ValueError("equal-token-budget must be >= 0")
+
+    max_new_tokens_effective = args.equal_token_budget if args.equal_token_budget > 0 else args.max_new_tokens
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +519,9 @@ def main() -> int:
     print(f"[setup] python_model={args.python_model}")
     print(f"[setup] c_model_dir={args.c_model_dir}")
     print(f"[setup] runs={args.runs}, warmup_runs={args.warmup_runs}")
+    print(f"[setup] max_new_tokens={args.max_new_tokens}, effective_max_new_tokens={max_new_tokens_effective}")
+    if args.equal_token_budget > 0:
+        print(f"[setup] equal_token_budget enabled: {args.equal_token_budget}")
     if shutil.which("sox") is None:
         print("[setup] warning: sox binary not found; install via `brew install sox` to remove SoX warnings.")
 
@@ -373,10 +530,26 @@ def main() -> int:
     token_id_str = ",".join(str(x) for x in token_ids)
     print(f"[setup] prompt tokens={len(token_ids)}")
 
-    py_summary, speaker, py_median_ms = _bench_python(args, out_dir)
-    c_summary, c_median_ms = _bench_c(args, out_dir, token_id_str, speaker)
+    py_summary, speaker, py_median_ms = _bench_python(args, out_dir, max_new_tokens_effective)
+    c_summary, c_median_ms = _bench_c(args, out_dir, token_id_str, speaker, max_new_tokens_effective)
 
     speedup = py_median_ms / c_median_ms if c_median_ms > 0 else None
+
+    py_median_ms_per_token = _extract_median(py_summary, ("normalized", "ms_per_token", "median"))
+    c_median_ms_per_token = _extract_median(c_summary, ("normalized", "ms_per_token", "median"))
+    py_median_ms_per_audio_sec = _extract_median(py_summary, ("normalized", "ms_per_audio_sec", "median"))
+    c_median_ms_per_audio_sec = _extract_median(c_summary, ("normalized", "ms_per_audio_sec", "median"))
+
+    c_over_py_ms_per_token = (
+        _safe_div(c_median_ms_per_token, py_median_ms_per_token)
+        if c_median_ms_per_token is not None and py_median_ms_per_token is not None
+        else None
+    )
+    c_over_py_ms_per_audio_sec = (
+        _safe_div(c_median_ms_per_audio_sec, py_median_ms_per_audio_sec)
+        if c_median_ms_per_audio_sec is not None and py_median_ms_per_audio_sec is not None
+        else None
+    )
 
     report = {
         "meta": {
@@ -404,6 +577,10 @@ def main() -> int:
             "subtalker_top_k": args.subtalker_top_k,
             "subtalker_top_p": args.subtalker_top_p,
             "max_new_tokens": args.max_new_tokens,
+            "equal_token_budget": args.equal_token_budget,
+            "effective_max_new_tokens": max_new_tokens_effective,
+            "gate_max_c_over_python_ms_per_token": args.gate_max_c_over_python_ms_per_token,
+            "gate_max_c_over_python_ms_per_audio_sec": args.gate_max_c_over_python_ms_per_audio_sec,
         },
         "python": py_summary,
         "c": c_summary,
@@ -411,6 +588,14 @@ def main() -> int:
             "median_speedup_c_over_python": speedup,
             "python_median_ms": py_median_ms,
             "c_median_ms": c_median_ms,
+            "normalized": {
+                "python_median_ms_per_token": py_median_ms_per_token,
+                "c_median_ms_per_token": c_median_ms_per_token,
+                "c_over_python_median_ms_per_token": c_over_py_ms_per_token,
+                "python_median_ms_per_audio_sec": py_median_ms_per_audio_sec,
+                "c_median_ms_per_audio_sec": c_median_ms_per_audio_sec,
+                "c_over_python_median_ms_per_audio_sec": c_over_py_ms_per_audio_sec,
+            },
         },
     }
 
@@ -422,7 +607,39 @@ def main() -> int:
     print(f"C median:      {c_median_ms:.2f} ms")
     if speedup is not None:
         print(f"C speedup:     {speedup:.2f}x (median)")
+    if c_over_py_ms_per_token is not None:
+        print(f"C/Py ms/token: {c_over_py_ms_per_token:.2f}x")
+    if c_over_py_ms_per_audio_sec is not None:
+        print(f"C/Py ms/audio-sec: {c_over_py_ms_per_audio_sec:.2f}x")
     print(f"Report:        {report_path}")
+
+    gate_failures: list[str] = []
+    if args.gate_max_c_over_python_ms_per_token > 0:
+        if c_over_py_ms_per_token is None:
+            gate_failures.append("ms_per_token ratio unavailable")
+        elif c_over_py_ms_per_token > args.gate_max_c_over_python_ms_per_token:
+            gate_failures.append(
+                "c_over_python_median_ms_per_token="
+                f"{c_over_py_ms_per_token:.3f} > {args.gate_max_c_over_python_ms_per_token:.3f}"
+            )
+
+    if args.gate_max_c_over_python_ms_per_audio_sec > 0:
+        if c_over_py_ms_per_audio_sec is None:
+            gate_failures.append("ms_per_audio_sec ratio unavailable")
+        elif c_over_py_ms_per_audio_sec > args.gate_max_c_over_python_ms_per_audio_sec:
+            gate_failures.append(
+                "c_over_python_median_ms_per_audio_sec="
+                f"{c_over_py_ms_per_audio_sec:.3f} > {args.gate_max_c_over_python_ms_per_audio_sec:.3f}"
+            )
+
+    if gate_failures:
+        print("\n[gate] FAILED")
+        for msg in gate_failures:
+            print(f"[gate] {msg}")
+        return 1
+
+    if args.gate_max_c_over_python_ms_per_token > 0 or args.gate_max_c_over_python_ms_per_audio_sec > 0:
+        print("[gate] PASSED")
 
     return 0
 

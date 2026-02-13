@@ -9,10 +9,10 @@
 
 ## P1 - Benchmark quality
 
-- [ ] Extend `scripts/benchmark_py_vs_c.py` report with generated token count and stop reason (EOS vs max token limit).
-- [ ] Add normalized comparison metrics: `ms/token`, `tokens/s`, and `ms/audio_sec`.
-- [ ] Add a benchmark mode that enforces equal decode length (fixed generated token budget for both paths).
-- [ ] Add CI benchmark gate using normalized metrics instead of only total elapsed time.
+- [x] Extend `scripts/benchmark_py_vs_c.py` report with generated token count and stop reason (EOS vs max token limit).
+- [x] Add normalized comparison metrics: `ms/token`, `tokens/s`, and `ms/audio_sec`.
+- [x] Add a benchmark mode that enforces equal decode length (fixed generated token budget for both paths).
+- [x] Add CI benchmark gate using normalized metrics instead of only total elapsed time.
 
 ## P2 - Performance follow-ups
 

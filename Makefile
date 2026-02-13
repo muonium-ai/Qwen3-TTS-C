@@ -40,6 +40,9 @@ BENCH_REP_PEN    ?= 1.05
 BENCH_SUB_TEMP   ?= 0.9
 BENCH_SUB_TOP_K  ?= 50
 BENCH_SUB_TOP_P  ?= 1.0
+BENCH_EQUAL_TOKEN_BUDGET ?= 0
+BENCH_GATE_MAX_C_OVER_PY_MS_PER_TOKEN ?= 0
+BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC ?= 0
 EOS_TEST_SCRIPT  ?= test/test_eos_regression.py
 EOS_MAX_TOKENS   ?= 256
 # Default local model path (downloaded by this repo workflow)
@@ -154,7 +157,25 @@ benchmark: all
 		--subtalker-temperature "$(BENCH_SUB_TEMP)" \
 		--subtalker-top-k "$(BENCH_SUB_TOP_K)" \
 		--subtalker-top-p "$(BENCH_SUB_TOP_P)" \
+		--equal-token-budget "$(BENCH_EQUAL_TOKEN_BUDGET)" \
+		--gate-max-c-over-python-ms-per-token "$(BENCH_GATE_MAX_C_OVER_PY_MS_PER_TOKEN)" \
+		--gate-max-c-over-python-ms-per-audio-sec "$(BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC)" \
 		--output-dir "$(BENCH_OUTPUT_DIR)"
+
+.PHONY: benchmark-gate
+benchmark-gate: BENCH_EQUAL_TOKEN_BUDGET = 128
+benchmark-gate: BENCH_RUNS = 1
+benchmark-gate: BENCH_WARMUP = 0
+benchmark-gate: BENCH_TOP_K = 1
+benchmark-gate: BENCH_TOP_P = 1.0
+benchmark-gate: BENCH_TEMP = 1.0
+benchmark-gate: BENCH_REP_PEN = 1.0
+benchmark-gate: BENCH_SUB_TOP_K = 1
+benchmark-gate: BENCH_SUB_TOP_P = 1.0
+benchmark-gate: BENCH_SUB_TEMP = 1.0
+benchmark-gate: BENCH_GATE_MAX_C_OVER_PY_MS_PER_TOKEN = 2.0
+benchmark-gate: BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC = 2.0
+benchmark-gate: benchmark
 
 .PHONY: setup-benchmark
 setup-benchmark:
@@ -215,6 +236,7 @@ help:
 	@echo "  make debug    Build with debug symbols + AddressSanitizer"
 	@echo "  make setup-benchmark Install Python benchmark dependencies into $(PYTHON)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
+	@echo "  make benchmark-gate Run benchmark with normalized-metric quality gates (CI-friendly)"
 	@echo "  make validate-eos Validate Python/C EOS stop parity (deterministic decode)"
 	@echo "  make test-eos-regression Assert C stops before max_tokens on standard prompt"
 	@echo "  make clean    Remove build artifacts"

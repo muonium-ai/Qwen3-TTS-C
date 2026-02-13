@@ -178,10 +178,14 @@ On Apple M-series Macs with Accelerate, expect roughly real-time generation. The
 - Use equal-work comparisons. Compare `ms/token` or runs that produce similar audio duration, not just wall-clock.
 - If C does not sample EOS early, it can run until `--max-tokens`, producing much longer audio and making speed comparisons misleading.
 - `make benchmark` currently uses `BENCH_MAX_TOKENS=512`, so C may generate up to `40.96s` audio (`512 * 0.08s`) while Python may stop earlier.
+- You can force a fixed token budget for both paths with `BENCH_EQUAL_TOKEN_BUDGET=<n>` (passed to `--equal-token-budget`).
+- For CI, use `make benchmark-gate` to gate on normalized metrics (`c/python ms_per_token` and `ms_per_audio_sec`) instead of raw elapsed time.
 - For quick parity checks, start with:
 
 ```bash
 make benchmark BENCH_RUNS=1 BENCH_WARMUP=0 BENCH_MAX_TOKENS=128
+make benchmark BENCH_RUNS=1 BENCH_WARMUP=0 BENCH_MAX_TOKENS=512 BENCH_EQUAL_TOKEN_BUDGET=128
+make benchmark-gate BENCH_SPEAKER=aiden
 make validate-eos BENCH_SPEAKER=aiden
 make test-eos-regression BENCH_SPEAKER=aiden
 ```
