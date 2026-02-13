@@ -694,19 +694,40 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
 
     for (int oc = 0; oc < out_channels; oc++) {
         int g = oc / out_per_group;
-        for (int t = 0; t < length; t++) {
-            float sum = bias ? bias[oc] : 0.0f;
-            for (int ic = 0; ic < ch_per_group; ic++) {
-                int abs_ic = g * ch_per_group + ic;
-                for (int k = 0; k < kernel_size; k++) {
-                    int input_t = t - pad + k * dilation;
-                    if (input_t >= 0 && input_t < length) {
-                        int widx = (oc * ch_per_group + ic) * kernel_size + k;
-                        sum += weight[widx] * input[abs_ic * length + input_t];
-                    }
+        int ic_base = g * ch_per_group;
+        float *out_ch = out + (size_t)oc * length;
+        float b = bias ? bias[oc] : 0.0f;
+        for (int t = 0; t < length; t++) out_ch[t] = b;
+
+        for (int ic = 0; ic < ch_per_group; ic++) {
+            const float *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
+            const float *in_ch = input + (size_t)(ic_base + ic) * length;
+
+            for (int k = 0; k < kernel_size; k++) {
+                float wk = w[k];
+                int shift = pad - k * dilation;
+                int out_start = shift;
+                int in_start = 0;
+                if (out_start < 0) {
+                    in_start = -out_start;
+                    out_start = 0;
                 }
+                if (out_start >= length || in_start >= length) continue;
+
+                int n = length - out_start;
+                int n_in = length - in_start;
+                if (n > n_in) n = n_in;
+                if (n <= 0) continue;
+#ifdef USE_BLAS
+                cblas_saxpy(n, wk, in_ch + in_start, 1, out_ch + out_start, 1);
+#else
+                const float *src = in_ch + in_start;
+                float *dst = out_ch + out_start;
+                for (int i = 0; i < n; i++) {
+                    dst[i] += wk * src[i];
+                }
+#endif
             }
-            out[oc * length + t] = sum;
         }
     }
 }
