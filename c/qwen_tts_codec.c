@@ -1,0 +1,564 @@
+/*
+ * qwen_tts_codec.c - Codec Decoder (Speech Tokenizer Decoder)
+ *
+ * Converts codec tokens to waveform:
+ *   1. SplitResidualVectorQuantizer: dequantize tokens → continuous embeddings
+ *   2. Pre-conv: CausalConv1d (codebook_dim → latent_dim, k=3)
+ *   3. Transformer: 8-layer sliding-window transformer (latent → hidden → latent)
+ *   4. Upsample: 2× (TransConv + ConvNeXt) stages
+ *   5. Vocoder (BigVGAN): initial conv → 4 blocks × (SnakeBeta + TransConv + 3×ResUnit) → final conv
+ *   6. Clamp to [-1, 1]
+ *
+ * Total upsampling: 2 × 2 × 8 × 5 × 4 × 3 = 1920×
+ * At 12.5 Hz codec rate, produces 24000 Hz audio.
+ */
+
+#include "qwen_tts.h"
+#include "qwen_tts_kernels.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern int qwen_tts_verbose;
+
+/* ========================================================================
+ * RVQ Dequantization
+ * ======================================================================== */
+
+/*
+ * Dequantize codes[time_steps][num_quantizers] into continuous embeddings.
+ *
+ * SplitResidualVectorQuantizer layout:
+ *   semantic: 1 codebook (quantizer 0)
+ *   acoustic: 15 codebooks (quantizers 1-15)
+ *
+ * For each VQ layer:
+ *   embedding = embedding_sum / cluster_usage  (EuclideanCodebook)
+ *   quantized = F.embedding(codes, embedding)
+ *   quantized = project_out(quantized)  -- Linear if codebook_dim != dim, else Identity
+ *   quantized = quantized.transpose(1, 2)
+ *
+ * Then: quantized = sum of all VQ layers → output_proj(Conv1d k=1)
+ *
+ * Output: [codebook_dim, time_steps]
+ */
+
+static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
+                                     int time_steps, int num_quantizers) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    qwen_tts_rvq_t *rvq = &ctx->codec.rvq;
+    int codebook_size = cfg->codec_codebook_size;
+
+    /* SplitResidualVectorQuantizer splits input into two halves:
+     *   half_latent = latent_dim / 2 = 512
+     *   vq_dim = codebook_dim / 2 = 256
+     *   Each branch: input_proj(half_latent→vq_dim) → VQ(vq_dim) → output_proj(vq_dim→half_latent)
+     *   Then concatenate semantic(512) + acoustic(512) = latent_dim(1024)
+     */
+
+    int latent_dim = cfg->codec_latent;           /* 1024 */
+    int half_latent = latent_dim / 2;              /* 512 */
+    int vq_dim = cfg->codec_codebook_dim / 2;     /* 256 */
+
+    /* Allocate VQ-domain partial sums */
+    float *semantic_sum = (float *)calloc((size_t)vq_dim * time_steps, sizeof(float));
+    float *acoustic_sum = (float *)calloc((size_t)vq_dim * time_steps, sizeof(float));
+
+    /* Process semantic codebook (quantizer 0) */
+    {
+        qwen_tts_codebook_t *cb = &rvq->semantic_codebooks[0];
+        /* Compute actual embeddings: embedding_sum / cluster_usage */
+        float *embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
+        for (int c = 0; c < codebook_size; c++) {
+            float usage = cb->cluster_usage[c];
+            if (usage < 1e-5f) usage = 1e-5f;
+            float inv_usage = 1.0f / usage;
+            for (int d = 0; d < vq_dim; d++) {
+                embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+            }
+        }
+
+        /* Look up codes and sum */
+        for (int t = 0; t < time_steps; t++) {
+            int code = codes[t * num_quantizers + 0];
+            if (code < 0) code = 0;
+            if (code >= codebook_size) code = 0;
+            for (int d = 0; d < vq_dim; d++) {
+                semantic_sum[d * time_steps + t] += embeddings[code * vq_dim + d];
+            }
+        }
+        free(embeddings);
+    }
+
+    /* Apply semantic output_proj: Conv1d(vq_dim, half_latent, 1, bias=False) */
+    float *semantic_out = (float *)calloc((size_t)half_latent * time_steps, sizeof(float));
+    if (rvq->semantic_output_proj) {
+        /* output_proj is [half_latent, vq_dim, 1] pointwise conv = matmul per timestep */
+        for (int t = 0; t < time_steps; t++) {
+            for (int od = 0; od < half_latent; od++) {
+                float sum = 0;
+                for (int id = 0; id < vq_dim; id++) {
+                    sum += rvq->semantic_output_proj[od * vq_dim + id] * semantic_sum[id * time_steps + t];
+                }
+                semantic_out[od * time_steps + t] = sum;
+            }
+        }
+    } else {
+        memcpy(semantic_out, semantic_sum, (size_t)half_latent * time_steps * sizeof(float));
+    }
+
+    /* Process acoustic codebooks (quantizers 1..num_quantizers-1) */
+    for (int q = 1; q < num_quantizers; q++) {
+        qwen_tts_codebook_t *cb = &rvq->acoustic_codebooks[q - 1];
+        float *embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
+        for (int c = 0; c < codebook_size; c++) {
+            float usage = cb->cluster_usage[c];
+            if (usage < 1e-5f) usage = 1e-5f;
+            float inv_usage = 1.0f / usage;
+            for (int d = 0; d < vq_dim; d++) {
+                embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+            }
+        }
+        for (int t = 0; t < time_steps; t++) {
+            int code = codes[t * num_quantizers + q];
+            if (code < 0) code = 0;
+            if (code >= codebook_size) code = 0;
+            for (int d = 0; d < vq_dim; d++) {
+                acoustic_sum[d * time_steps + t] += embeddings[code * vq_dim + d];
+            }
+        }
+        free(embeddings);
+    }
+
+    /* Apply acoustic output_proj */
+    float *acoustic_out = (float *)calloc((size_t)half_latent * time_steps, sizeof(float));
+    if (rvq->acoustic_output_proj) {
+        for (int t = 0; t < time_steps; t++) {
+            for (int od = 0; od < half_latent; od++) {
+                float sum = 0;
+                for (int id = 0; id < vq_dim; id++) {
+                    sum += rvq->acoustic_output_proj[od * vq_dim + id] * acoustic_sum[id * time_steps + t];
+                }
+                acoustic_out[od * time_steps + t] = sum;
+            }
+        }
+    } else {
+        memcpy(acoustic_out, acoustic_sum, (size_t)half_latent * time_steps * sizeof(float));
+    }
+
+    /* Sum semantic + acoustic → [codebook_dim=512, time_steps] */
+    float *output = (float *)malloc((size_t)half_latent * time_steps * sizeof(float));
+    for (size_t i = 0; i < (size_t)half_latent * time_steps; i++) {
+        output[i] = semantic_out[i] + acoustic_out[i];
+    }
+
+    free(semantic_sum); free(acoustic_sum);
+    free(semantic_out); free(acoustic_out);
+
+    return output; /* [codebook_dim, time_steps] in channels-first format */
+}
+
+/* ========================================================================
+ * Codec Transformer (8 layers, sliding window attention, LayerScale)
+ * ======================================================================== */
+
+static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
+                                        int seq_len) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int codec_hidden = cfg->codec_hidden;
+    int latent = cfg->codec_latent;
+    int layers = cfg->codec_layers;
+    int heads = cfg->codec_heads;
+    int kv_heads = cfg->codec_kv_heads;
+    int head_dim = codec_hidden / heads;
+    int kv_dim = kv_heads * head_dim;
+    int intermediate = cfg->codec_intermediate;
+    int sliding_window = cfg->codec_sliding_window;
+    int groups_per_head = heads / kv_heads;
+    float eps = cfg->codec_rms_norm_eps;
+
+    /* hidden comes as [seq_len, latent] format (already transposed from channels-first) */
+
+    /* Input projection: latent_dim → codec_hidden */
+    float *x = (float *)malloc((size_t)seq_len * codec_hidden * sizeof(float));
+    for (int t = 0; t < seq_len; t++) {
+        kernel_matvec_f32(x + t * codec_hidden,
+                          ctx->codec.transformer_input_proj_weight,
+                          hidden + t * latent, codec_hidden, latent);
+        if (ctx->codec.transformer_input_proj_bias)
+            kernel_add_inplace(x + t * codec_hidden,
+                              ctx->codec.transformer_input_proj_bias, codec_hidden);
+    }
+
+    /* Compute RoPE cache */
+    float *rope_cos = (float *)malloc((size_t)seq_len * head_dim * sizeof(float));
+    float *rope_sin = (float *)malloc((size_t)seq_len * head_dim * sizeof(float));
+    {
+        int half = head_dim / 2;
+        float theta = 10000.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+                float angle = (float)pos * freq;
+                rope_cos[pos * head_dim + i] = cosf(angle);
+                rope_cos[pos * head_dim + i + half] = cosf(angle);
+                rope_sin[pos * head_dim + i] = sinf(angle);
+                rope_sin[pos * head_dim + i + half] = sinf(angle);
+            }
+        }
+    }
+
+    /* Scratch buffers */
+    float *x_norm = (float *)malloc((size_t)seq_len * codec_hidden * sizeof(float));
+    float *q_all = (float *)malloc((size_t)seq_len * heads * head_dim * sizeof(float));
+    float *k_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *v_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
+    float *attn_out = (float *)malloc((size_t)seq_len * heads * head_dim * sizeof(float));
+
+    for (int layer = 0; layer < layers; layer++) {
+        qwen_tts_codec_transformer_layer_t *l = &ctx->codec.transformer_layers[layer];
+
+        /* 1. Input RMSNorm */
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
+                           l->input_norm, codec_hidden, eps);
+
+        /* 2. Q, K, V projections */
+        for (int t = 0; t < seq_len; t++) {
+            kernel_matvec_f32(q_all + t * heads * head_dim, l->wq,
+                             x_norm + t * codec_hidden, heads * head_dim, codec_hidden);
+            kernel_matvec_f32(k_all + t * kv_dim, l->wk,
+                             x_norm + t * codec_hidden, kv_dim, codec_hidden);
+            kernel_matvec_f32(v_all + t * kv_dim, l->wv,
+                             x_norm + t * codec_hidden, kv_dim, codec_hidden);
+        }
+
+        /* 3. RoPE (standard, not M-RoPE. No QK-Norm for codec decoder) */
+        for (int t = 0; t < seq_len; t++) {
+            kernel_rope_apply(q_all + t * heads * head_dim, NULL,
+                             rope_cos + t * head_dim, rope_sin + t * head_dim,
+                             heads, head_dim);
+            kernel_rope_apply(k_all + t * kv_dim, NULL,
+                             rope_cos + t * head_dim, rope_sin + t * head_dim,
+                             kv_heads, head_dim);
+        }
+
+        /* 4. Sliding-window causal attention */
+        float scale = 1.0f / sqrtf((float)head_dim);
+        memset(attn_out, 0, (size_t)seq_len * heads * head_dim * sizeof(float));
+
+        for (int h = 0; h < heads; h++) {
+            int kv_h = h / groups_per_head;
+            for (int qi = 0; qi < seq_len; qi++) {
+                float *qh = q_all + qi * heads * head_dim + h * head_dim;
+                int start = qi - sliding_window + 1;
+                if (start < 0) start = 0;
+
+                /* Compute attention scores within window */
+                int wlen = qi - start + 1;
+                float *scores = (float *)alloca(wlen * sizeof(float));
+                float max_score = -1e30f;
+
+                for (int ki = start; ki <= qi; ki++) {
+                    float *kh = k_all + ki * kv_dim + kv_h * head_dim;
+                    float score = 0;
+                    for (int d = 0; d < head_dim; d++) score += qh[d] * kh[d];
+                    score *= scale;
+                    scores[ki - start] = score;
+                    if (score > max_score) max_score = score;
+                }
+
+                float sum = 0;
+                for (int i = 0; i < wlen; i++) {
+                    scores[i] = expf(scores[i] - max_score);
+                    sum += scores[i];
+                }
+                float inv = 1.0f / sum;
+
+                float *oh = attn_out + qi * heads * head_dim + h * head_dim;
+                for (int ki = start; ki <= qi; ki++) {
+                    float w = scores[ki - start] * inv;
+                    float *vh = v_all + ki * kv_dim + kv_h * head_dim;
+                    for (int d = 0; d < head_dim; d++) oh[d] += w * vh[d];
+                }
+            }
+        }
+
+        /* 5. Output projection + LayerScale + residual */
+        for (int t = 0; t < seq_len; t++) {
+            kernel_matvec_f32(x_norm + t * codec_hidden, l->wo,
+                             attn_out + t * heads * head_dim, codec_hidden, heads * head_dim);
+            /* LayerScale */
+            if (l->attn_layer_scale)
+                kernel_mul_inplace(x_norm + t * codec_hidden, l->attn_layer_scale, codec_hidden);
+            kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
+        }
+
+        /* 6. Post-attention norm + SwiGLU MLP + LayerScale */
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
+                           l->post_attn_norm, codec_hidden, eps);
+
+        /* MLP: gate + up → silu → mul → down */
+        float *gate = (float *)malloc(intermediate * sizeof(float));
+        float *up = (float *)malloc(intermediate * sizeof(float));
+        for (int t = 0; t < seq_len; t++) {
+            kernel_matvec_f32(gate, l->gate, x_norm + t * codec_hidden, intermediate, codec_hidden);
+            kernel_matvec_f32(up, l->up, x_norm + t * codec_hidden, intermediate, codec_hidden);
+            kernel_silu_inplace(gate, intermediate);
+            kernel_mul_inplace(gate, up, intermediate);
+            kernel_matvec_f32(x_norm + t * codec_hidden, l->down, gate, codec_hidden, intermediate);
+            /* LayerScale */
+            if (l->mlp_layer_scale)
+                kernel_mul_inplace(x_norm + t * codec_hidden, l->mlp_layer_scale, codec_hidden);
+            kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
+        }
+        free(gate); free(up);
+    }
+
+    /* Final norm */
+    if (ctx->codec.transformer_norm) {
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm_inplace(x + t * codec_hidden, ctx->codec.transformer_norm, codec_hidden, eps);
+    }
+
+    /* Output projection: codec_hidden → latent_dim */
+    for (int t = 0; t < seq_len; t++) {
+        kernel_matvec_f32(hidden + t * latent,
+                          ctx->codec.transformer_output_proj_weight,
+                          x + t * codec_hidden, latent, codec_hidden);
+        if (ctx->codec.transformer_output_proj_bias)
+            kernel_add_inplace(hidden + t * latent,
+                              ctx->codec.transformer_output_proj_bias, latent);
+    }
+
+    free(x); free(x_norm); free(q_all); free(k_all); free(v_all);
+    free(attn_out); free(rope_cos); free(rope_sin);
+}
+
+/* ========================================================================
+ * ConvNeXt upsampling block
+ * ======================================================================== */
+
+static void codec_convnext_forward(qwen_tts_convnext_block_t *block,
+                                     float *hidden, int dim, int *length) {
+    int len = *length;
+
+    /* Residual */
+    float *residual = (float *)malloc((size_t)dim * len * sizeof(float));
+    memcpy(residual, hidden, (size_t)dim * len * sizeof(float));
+
+    /* Depthwise causal conv (k=7, groups=dim) */
+    float *conv_out = (float *)malloc((size_t)dim * len * sizeof(float));
+    kernel_causal_conv1d(conv_out, hidden, block->dwconv_weight, block->dwconv_bias,
+                         dim, dim, 7, len, 1, dim);
+
+    /* permute to [len, dim] for LayerNorm and pointwise ops */
+    float *x_ld = (float *)malloc((size_t)len * dim * sizeof(float));
+    for (int c = 0; c < dim; c++)
+        for (int t = 0; t < len; t++)
+            x_ld[t * dim + c] = conv_out[c * len + t];
+
+    /* LayerNorm */
+    for (int t = 0; t < len; t++)
+        kernel_layer_norm(x_ld + t * dim, x_ld + t * dim, block->norm_weight, block->norm_bias, dim, 1e-6f);
+
+    /* pwconv1: [dim] → [4*dim] */
+    int dim4 = 4 * dim;
+    float *pw1 = (float *)malloc((size_t)len * dim4 * sizeof(float));
+    for (int t = 0; t < len; t++) {
+        kernel_matvec_f32(pw1 + t * dim4, block->pwconv1_weight, x_ld + t * dim, dim4, dim);
+        if (block->pwconv1_bias)
+            kernel_add_inplace(pw1 + t * dim4, block->pwconv1_bias, dim4);
+    }
+
+    /* GELU */
+    kernel_gelu_inplace(pw1, len * dim4);
+
+    /* pwconv2: [4*dim] → [dim] */
+    for (int t = 0; t < len; t++) {
+        kernel_matvec_f32(x_ld + t * dim, block->pwconv2_weight, pw1 + t * dim4, dim, dim4);
+        if (block->pwconv2_bias)
+            kernel_add_inplace(x_ld + t * dim, block->pwconv2_bias, dim);
+    }
+
+    /* Apply gamma (learnable residual scale) */
+    for (int t = 0; t < len; t++)
+        kernel_mul_inplace(x_ld + t * dim, block->gamma, dim);
+
+    /* permute back to [dim, len] */
+    for (int c = 0; c < dim; c++)
+        for (int t = 0; t < len; t++)
+            hidden[c * len + t] = x_ld[t * dim + c];
+
+    /* Skip connection */
+    kernel_add_inplace(hidden, residual, dim * len);
+
+    free(residual); free(conv_out); free(x_ld); free(pw1);
+}
+
+/* ========================================================================
+ * Vocoder residual unit
+ * ======================================================================== */
+
+static void vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
+                                      float *hidden, int dim, int length, int dilation) {
+    float *residual = (float *)malloc((size_t)dim * length * sizeof(float));
+    memcpy(residual, hidden, (size_t)dim * length * sizeof(float));
+
+    /* SnakeBeta activation 1 */
+    float *act1 = (float *)malloc((size_t)dim * length * sizeof(float));
+    kernel_snake_beta(act1, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
+
+    /* Causal conv1 (k=7, dilation) */
+    float *conv1_out = (float *)malloc((size_t)dim * length * sizeof(float));
+    kernel_causal_conv1d(conv1_out, act1, unit->conv1_weight, unit->conv1_bias,
+                         dim, dim, 7, length, dilation, 1);
+
+    /* SnakeBeta activation 2 */
+    float *act2 = (float *)malloc((size_t)dim * length * sizeof(float));
+    kernel_snake_beta(act2, conv1_out, unit->act2_alpha, unit->act2_beta, dim, length);
+
+    /* Causal conv2 (k=1, dilation=1) */
+    kernel_causal_conv1d(hidden, act2, unit->conv2_weight, unit->conv2_bias,
+                         dim, dim, 1, length, 1, 1);
+
+    /* Skip connection */
+    kernel_add_inplace(hidden, residual, dim * length);
+
+    free(residual); free(act1); free(conv1_out); free(act2);
+}
+
+/* ========================================================================
+ * Full codec decode pipeline
+ * ======================================================================== */
+
+float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
+                              int time_steps, int *out_samples) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int num_quantizers = cfg->codec_num_quantizers;
+    int latent_dim = cfg->codec_latent;
+    int codebook_dim = cfg->codec_codebook_dim;
+
+    if (qwen_tts_verbose >= 1)
+        fprintf(stderr, "Codec decode: %d timesteps, %d quantizers\n", time_steps, num_quantizers);
+
+    /* 1. RVQ Dequantize → [codebook_dim, time_steps] */
+    float *hidden = codec_rvq_dequantize(ctx, codes, time_steps, num_quantizers);
+
+    /* 2. Pre-conv: CausalConv1d(codebook_dim=512, latent_dim=1024, k=3) */
+    float *pre_conv_out = (float *)malloc((size_t)latent_dim * time_steps * sizeof(float));
+    kernel_causal_conv1d(pre_conv_out, hidden, ctx->codec.pre_conv_weight,
+                         ctx->codec.pre_conv_bias, codebook_dim, latent_dim,
+                         3, time_steps, 1, 1);
+    free(hidden);
+
+    /* 3. Transpose to [time_steps, latent_dim] for transformer */
+    float *hidden_seq = (float *)malloc((size_t)time_steps * latent_dim * sizeof(float));
+    for (int c = 0; c < latent_dim; c++)
+        for (int t = 0; t < time_steps; t++)
+            hidden_seq[t * latent_dim + c] = pre_conv_out[c * time_steps + t];
+    free(pre_conv_out);
+
+    /* 4. Transformer forward pass */
+    codec_transformer_forward(ctx, hidden_seq, time_steps);
+
+    /* 5. Transpose back to [latent_dim, time_steps] */
+    hidden = (float *)malloc((size_t)latent_dim * time_steps * sizeof(float));
+    for (int c = 0; c < latent_dim; c++)
+        for (int t = 0; t < time_steps; t++)
+            hidden[c * time_steps + t] = hidden_seq[t * latent_dim + c];
+    free(hidden_seq);
+
+    /* 6. Upsample stages (2× TransConv + ConvNeXt) */
+    int current_len = time_steps;
+    for (int stage = 0; stage < 2; stage++) {
+        int factor = cfg->codec_upsampling_ratios[stage];
+        int new_len;
+
+        /* TransposedConv1d upsample */
+        float *up_out = (float *)malloc((size_t)latent_dim * (current_len * factor + factor) * sizeof(float));
+        kernel_transposed_conv1d(up_out, hidden, ctx->codec.upsample_transconv_weight[stage],
+                                  ctx->codec.upsample_transconv_bias[stage],
+                                  latent_dim, latent_dim, factor, factor, current_len, &new_len);
+        free(hidden);
+        hidden = (float *)realloc(up_out, (size_t)latent_dim * new_len * sizeof(float));
+        current_len = new_len;
+
+        /* ConvNeXt block */
+        codec_convnext_forward(&ctx->codec.upsample_convnext[stage], hidden, latent_dim, &current_len);
+    }
+
+    /* 7. Vocoder */
+
+    /* 7a. Initial conv: CausalConv1d(latent_dim, decoder_dim, k=7) */
+    int decoder_dim = cfg->codec_decoder_dim;
+    float *voc = (float *)malloc((size_t)decoder_dim * current_len * sizeof(float));
+    kernel_causal_conv1d(voc, hidden, ctx->codec.vocoder_pre_conv_weight,
+                         ctx->codec.vocoder_pre_conv_bias,
+                         latent_dim, decoder_dim, 7, current_len, 1, 1);
+    free(hidden);
+
+    /* 7b. 4 decoder blocks: SnakeBeta → TransConv → 3 ResUnits */
+    int upsample_rates[4] = {
+        cfg->codec_upsample_rates[0],
+        cfg->codec_upsample_rates[1],
+        cfg->codec_upsample_rates[2],
+        cfg->codec_upsample_rates[3],
+    };
+    int current_dim = decoder_dim;
+
+    for (int block = 0; block < 4; block++) {
+        int in_dim = current_dim;
+        int out_dim = in_dim / 2;
+        int rate = upsample_rates[block];
+        qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
+
+        /* SnakeBeta activation */
+        float *activated = (float *)malloc((size_t)in_dim * current_len * sizeof(float));
+        kernel_snake_beta(activated, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
+
+        /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
+        int new_len;
+        int kernel = 2 * rate;
+        float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
+        kernel_transposed_conv1d(transconv_out, activated, vb->transconv_weight, vb->transconv_bias,
+                                  in_dim, out_dim, kernel, rate, current_len, &new_len);
+        free(activated);
+        free(voc);
+
+        voc = (float *)realloc(transconv_out, (size_t)out_dim * new_len * sizeof(float));
+        current_len = new_len;
+        current_dim = out_dim;
+
+        /* 3 Residual units with dilations 1, 3, 9 */
+        int dilations[3] = {1, 3, 9};
+        for (int ru = 0; ru < 3; ru++) {
+            vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len, dilations[ru]);
+        }
+    }
+
+    /* 7c. Final: SnakeBeta → CausalConv1d → output channel 1 */
+    float *final_act = (float *)malloc((size_t)current_dim * current_len * sizeof(float));
+    kernel_snake_beta(final_act, voc, ctx->codec.vocoder_final_act_alpha,
+                      ctx->codec.vocoder_final_act_beta, current_dim, current_len);
+    free(voc);
+
+    /* Final conv: [current_dim, current_len] → [1, current_len] */
+    float *wav = (float *)malloc((size_t)current_len * sizeof(float));
+    kernel_causal_conv1d(wav, final_act, ctx->codec.vocoder_final_conv_weight,
+                         ctx->codec.vocoder_final_conv_bias,
+                         current_dim, 1, 7, current_len, 1, 1);
+    free(final_act);
+
+    /* 8. Clamp to [-1, 1] */
+    kernel_clamp(wav, current_len, -1.0f, 1.0f);
+
+    *out_samples = current_len;
+
+    if (qwen_tts_verbose >= 1)
+        fprintf(stderr, "Codec decode complete: %d samples (%.2f seconds)\n",
+                current_len, (float)current_len / QWEN_TTS_SAMPLE_RATE);
+
+    return wav;
+}

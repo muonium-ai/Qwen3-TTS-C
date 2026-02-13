@@ -22,3 +22,13 @@ wheels/
 .vscode/
 venv/
 env/
+# C build artifacts
+qwen-tts
+*.o
+*.dSYM/
+
+# Model weights (too large for git)
+model/
+
+# Test outputs
+test/*.wav
