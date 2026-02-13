@@ -16,7 +16,6 @@
 
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
-#include <float.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +36,37 @@ static inline void st_axpy(int n, float alpha, const float *x, float *y) {
 #else
     for (int i = 0; i < n; i++) y[i] += alpha * x[i];
 #endif
+}
+
+static int ensure_talker_prefill_buffers(qwen_tts_ctx_t *ctx, int seq_len) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int hidden = cfg->talker_hidden;
+    int num_heads = cfg->talker_heads;
+    int head_dim = cfg->talker_head_dim;
+    int kv_dim = cfg->talker_kv_heads * head_dim;
+    int intermediate = cfg->talker_intermediate;
+
+    if (ctx->tk_pref_cap >= seq_len) return 0;
+
+#define REALLOC_PREF_FIELD(field, count) do { \
+    float *tmp = (float *)realloc(ctx->field, (size_t)(count) * sizeof(float)); \
+    if (!tmp) return -1; \
+    ctx->field = tmp; \
+} while (0)
+
+    REALLOC_PREF_FIELD(tk_pref_x, (size_t)seq_len * hidden);
+    REALLOC_PREF_FIELD(tk_pref_x_norm, (size_t)seq_len * hidden);
+    REALLOC_PREF_FIELD(tk_pref_q, (size_t)seq_len * num_heads * head_dim);
+    REALLOC_PREF_FIELD(tk_pref_k, (size_t)seq_len * kv_dim);
+    REALLOC_PREF_FIELD(tk_pref_v, (size_t)seq_len * kv_dim);
+    REALLOC_PREF_FIELD(tk_pref_attn_out, (size_t)seq_len * num_heads * head_dim);
+    REALLOC_PREF_FIELD(tk_pref_gate, (size_t)seq_len * intermediate);
+    REALLOC_PREF_FIELD(tk_pref_gate_up, (size_t)seq_len * intermediate);
+
+#undef REALLOC_PREF_FIELD
+
+    ctx->tk_pref_cap = seq_len;
+    return 0;
 }
 
 /* ========================================================================
@@ -175,33 +205,22 @@ static void talker_attention_single(
 
         /* Compute attention scores for this head */
         float *scores = ctx->tk_scores;
-        float max_score = -FLT_MAX;
 
         for (int t = 0; t < seq_len; t++) {
             float *kt = ctx->talker_kv_k + (size_t)layer_idx * kv_stride + (size_t)t * kv_dim + kv_h * head_dim;
-            float score = 0.0f;
-            for (int d = 0; d < head_dim; d++) score += qh[d] * kt[d];
-            score *= scale;
+            float score = st_dot(qh, kt, head_dim) * scale;
             scores[t] = score;
-            if (score > max_score) max_score = score;
         }
 
         /* Softmax */
-        float sum = 0.0f;
-        for (int t = 0; t < seq_len; t++) {
-            scores[t] = expf(scores[t] - max_score);
-            sum += scores[t];
-        }
-        float inv_sum = 1.0f / sum;
-        for (int t = 0; t < seq_len; t++) scores[t] *= inv_sum;
+        kernel_softmax(scores, seq_len);
 
         /* Weighted sum of V */
         float *oh = attn_out + h * head_dim;
         memset(oh, 0, head_dim * sizeof(float));
         for (int t = 0; t < seq_len; t++) {
             float *vt = ctx->talker_kv_v + (size_t)layer_idx * kv_stride + (size_t)t * kv_dim + kv_h * head_dim;
-            float s = scores[t];
-            for (int d = 0; d < head_dim; d++) oh[d] += s * vt[d];
+            st_axpy(head_dim, scores[t], vt, oh);
         }
     }
 
@@ -255,25 +274,52 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
         ctx->talker_kv_max = new_max;
     }
 
-    /* Allocate working buffers for prefill */
-    float *x = (float *)malloc((size_t)seq_len * hidden * sizeof(float));
-    float *x_norm = (float *)malloc((size_t)seq_len * hidden * sizeof(float));
-    float *q_all = (float *)malloc((size_t)seq_len * num_heads * head_dim * sizeof(float));
-    float *k_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
-    float *v_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
-    float *attn_scores = (float *)malloc((size_t)num_heads * seq_len * seq_len * sizeof(float));
-    float *attn_out = (float *)malloc((size_t)seq_len * num_heads * head_dim * sizeof(float));
+    if (ensure_talker_prefill_buffers(ctx, seq_len) != 0) {
+        fprintf(stderr, "Error: failed to allocate talker prefill buffers\n");
+        return;
+    }
+    float *x = ctx->tk_pref_x;
+    float *x_norm = ctx->tk_pref_x_norm;
+    float *q_all = ctx->tk_pref_q;
+    float *k_all = ctx->tk_pref_k;
+    float *v_all = ctx->tk_pref_v;
+    float *attn_out = ctx->tk_pref_attn_out;
+    float *gate_all = ctx->tk_pref_gate;
+    float *up_all = ctx->tk_pref_gate_up;
+    float *scores = (float *)malloc((size_t)seq_len * sizeof(float));
+    if (!scores) {
+        fprintf(stderr, "Error: failed to allocate talker score buffer\n");
+        return;
+    }
 
     /* Copy input embeddings */
     memcpy(x, input_embeds, (size_t)seq_len * hidden * sizeof(float));
 
-    /* Compute M-RoPE cos/sin for all positions */
-    float *cos_all = (float *)malloc((size_t)seq_len * 3 * head_dim * sizeof(float));
-    float *sin_all = (float *)malloc((size_t)seq_len * 3 * head_dim * sizeof(float));
-    for (int p = 0; p < seq_len; p++) {
-        compute_mrope_pos(cos_all + p * 3 * head_dim, sin_all + p * 3 * head_dim,
-                          p, head_dim, cfg->talker_rope_theta);
+    /* Compute/cached M-RoPE cos/sin for all positions */
+    if (!ctx->talker_rope_cos_cache || !ctx->talker_rope_sin_cache || ctx->talker_rope_cache_cap < seq_len) {
+        size_t rope_size = (size_t)seq_len * 3 * head_dim;
+        float *cos_new = (float *)malloc(rope_size * sizeof(float));
+        float *sin_new = (float *)malloc(rope_size * sizeof(float));
+        if (!cos_new || !sin_new) {
+            free(cos_new);
+            free(sin_new);
+            free(scores);
+            fprintf(stderr, "Error: failed to allocate talker M-RoPE cache\n");
+            return;
+        }
+        free(ctx->talker_rope_cos_cache);
+        free(ctx->talker_rope_sin_cache);
+        ctx->talker_rope_cos_cache = cos_new;
+        ctx->talker_rope_sin_cache = sin_new;
+        for (int p = 0; p < seq_len; p++) {
+            compute_mrope_pos(ctx->talker_rope_cos_cache + (size_t)p * 3 * head_dim,
+                              ctx->talker_rope_sin_cache + (size_t)p * 3 * head_dim,
+                              p, head_dim, cfg->talker_rope_theta);
+        }
+        ctx->talker_rope_cache_cap = seq_len;
     }
+    float *cos_all = ctx->talker_rope_cos_cache;
+    float *sin_all = ctx->talker_rope_sin_cache;
 
     for (int layer = 0; layer < cfg->talker_layers; layer++) {
         qwen_tts_talker_layer_t *l = &ctx->talker.layers[layer];
@@ -359,32 +405,22 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
             /* Compute attention scores: [seq, seq] for this head */
             for (int qi = 0; qi < seq_len; qi++) {
                 float *qh = q_all + qi * num_heads * head_dim + h * head_dim;
-                float max_score = -FLT_MAX;
 
                 for (int ki = 0; ki <= qi; ki++) {  /* causal */
                     float *kh = k_all + ki * kv_dim + kv_h * head_dim;
-                    float score = 0.0f;
-                    for (int d = 0; d < head_dim; d++) score += qh[d] * kh[d];
-                    score *= scale;
-                    attn_scores[h * seq_len * seq_len + qi * seq_len + ki] = score;
-                    if (score > max_score) max_score = score;
+                    float score = st_dot(qh, kh, head_dim) * scale;
+                    scores[ki] = score;
                 }
 
                 /* Softmax over causal window */
-                float sum = 0.0f;
-                for (int ki = 0; ki <= qi; ki++) {
-                    float s = expf(attn_scores[h * seq_len * seq_len + qi * seq_len + ki] - max_score);
-                    attn_scores[h * seq_len * seq_len + qi * seq_len + ki] = s;
-                    sum += s;
-                }
-                float inv = 1.0f / sum;
+                kernel_softmax(scores, qi + 1);
 
                 /* Weighted sum of V */
                 float *oh = attn_out + qi * num_heads * head_dim + h * head_dim;
                 for (int ki = 0; ki <= qi; ki++) {
-                    float w = attn_scores[h * seq_len * seq_len + qi * seq_len + ki] * inv;
+                    float w = scores[ki];
                     float *vh = v_all + ki * kv_dim + kv_h * head_dim;
-                    for (int d = 0; d < head_dim; d++) oh[d] += w * vh[d];
+                    st_axpy(head_dim, w, vh, oh);
                 }
             }
         }
@@ -401,9 +437,6 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
             kernel_rms_norm(x_norm + t * hidden, x + t * hidden, l->post_attn_norm, hidden, eps);
 
         /* Gate + Up projections (batch) */
-        float *gate_all = (float *)malloc((size_t)seq_len * cfg->talker_intermediate * sizeof(float));
-        float *up_all = (float *)malloc((size_t)seq_len * cfg->talker_intermediate * sizeof(float));
-
         kernel_matmul_bf16(gate_all, x_norm, l->gate_bf16, seq_len, cfg->talker_intermediate, hidden);
         kernel_matmul_bf16(up_all, x_norm, l->up_bf16, seq_len, cfg->talker_intermediate, hidden);
 
@@ -422,8 +455,6 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
         for (int t = 0; t < seq_len; t++)
             kernel_add_inplace(x + t * hidden, x_norm + t * hidden, hidden);
 
-        free(gate_all);
-        free(up_all);
     }
 
     /* Final norm */
@@ -437,8 +468,7 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
 
     ctx->talker_kv_len = seq_len;
 
-    free(x); free(x_norm); free(q_all); free(k_all); free(v_all);
-    free(attn_scores); free(attn_out); free(cos_all); free(sin_all);
+    free(scores);
 
     if (qwen_tts_verbose >= 1) {
         fprintf(stderr, "Talker prefill complete: %d tokens\n", seq_len);
@@ -649,10 +679,14 @@ void qwen_tts_subtalker_generate(
             kernel_rms_norm(x_norm, x, l->post_attn_norm, st_hidden, eps); \
             float *_gate = st_gate_buf; \
             float *_up = st_up_buf; \
-            kernel_matvec_bf16(_gate, l->gate_bf16, x_norm, st_intermediate, st_hidden); \
-            kernel_matvec_bf16(_up, l->up_bf16, x_norm, st_intermediate, st_hidden); \
-            kernel_silu_inplace(_gate, st_intermediate); \
-            kernel_mul_inplace(_gate, _up, st_intermediate); \
+            if (l->gate_up_fused_bf16) { \
+                kernel_swiglu_matvec_bf16(_gate, l->gate_up_fused_bf16, x_norm, st_intermediate, st_hidden); \
+            } else { \
+                kernel_matvec_bf16(_gate, l->gate_bf16, x_norm, st_intermediate, st_hidden); \
+                kernel_matvec_bf16(_up, l->up_bf16, x_norm, st_intermediate, st_hidden); \
+                kernel_silu_inplace(_gate, st_intermediate); \
+                kernel_mul_inplace(_gate, _up, st_intermediate); \
+            } \
             kernel_matvec_bf16(x_norm, l->down_bf16, _gate, st_hidden, st_intermediate); \
             kernel_add_inplace(x, x_norm, st_hidden); \
         } \

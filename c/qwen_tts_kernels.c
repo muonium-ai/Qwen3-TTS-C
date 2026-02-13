@@ -197,21 +197,23 @@ void kernel_matmul_bf16(float *C, const float *A, const uint16_t *B_bf16, int M,
 void kernel_swiglu_matvec_bf16(float *out, const uint16_t *gate_up_fused_bf16,
                                 const float *x, int intermediate, int hidden) {
     /* gate_up_fused is [2*intermediate, hidden], first half is gate, second is up */
-    float *gate = (float *)malloc(intermediate * sizeof(float));
-    float *up = (float *)malloc(intermediate * sizeof(float));
-
-    kernel_matvec_bf16(gate, gate_up_fused_bf16, x, intermediate, hidden);
-    kernel_matvec_bf16(up, gate_up_fused_bf16 + (size_t)intermediate * hidden, x, intermediate, hidden);
-
-    for (int i = 0; i < intermediate; i++) {
-        /* SiLU(gate) * up */
-        float g = gate[i];
-        float silu_g = g / (1.0f + expf(-g));
-        out[i] = silu_g * up[i];
+    static float *up_scratch = NULL;
+    static size_t up_scratch_cap = 0;
+    if ((size_t)intermediate > up_scratch_cap) {
+        float *tmp = (float *)realloc(up_scratch, (size_t)intermediate * sizeof(float));
+        if (!tmp) return;
+        up_scratch = tmp;
+        up_scratch_cap = (size_t)intermediate;
     }
 
-    free(gate);
-    free(up);
+    kernel_matvec_bf16(out, gate_up_fused_bf16, x, intermediate, hidden);
+    kernel_matvec_bf16(up_scratch, gate_up_fused_bf16 + (size_t)intermediate * hidden,
+                       x, intermediate, hidden);
+
+    for (int i = 0; i < intermediate; i++) {
+        float g = out[i];
+        out[i] = (g / (1.0f + expf(-g))) * up_scratch[i];
+    }
 }
 
 /* ======================================================================== */

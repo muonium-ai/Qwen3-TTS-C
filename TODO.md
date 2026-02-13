@@ -16,8 +16,12 @@
 
 ## P2 - Performance follow-ups
 
-- [ ] Re-profile after head-dim fix to identify true hotspots.
-- [ ] Vectorize remaining talker attention inner loops (dot + weighted sum) where BLAS is not used.
-- [ ] Improve subtalker throughput with better batching/reuse for repeated small matvec calls.
-- [ ] Reduce per-step allocator/memory traffic in generation loops.
+- [x] Re-profile after head-dim fix to identify true hotspots.
+- [x] Vectorize remaining talker attention inner loops (dot + weighted sum) where BLAS is not used.
+- [x] Improve subtalker throughput with better batching/reuse for repeated small matvec calls.
+- [x] Reduce per-step allocator/memory traffic in generation loops.
 - [ ] Investigate codec decoder kernel fusion opportunities after talker parity is stable.
+
+Latest profile snapshot (2026-02-13, `./qwen-tts -v -v`, deterministic decode):
+- Talker decode: ~11.5s for 74 tokens (~155 ms/token).
+- Codec total: ~4.16s, dominated by vocoder (~3.93s).

@@ -534,6 +534,14 @@ static void load_subtalker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_
         GET_BF16_CHECK(l->up_bf16, ms, name);
         snprintf(name, sizeof(name), "talker.code_predictor.model.layers.%d.mlp.down_proj.weight", i);
         GET_BF16_CHECK(l->down_bf16, ms, name);
+
+        /* Optional fused gate+up weights for faster single-token subtalker MLP. */
+        size_t gu_size = (size_t)cfg->subtalker_intermediate * cfg->subtalker_hidden;
+        l->gate_up_fused_bf16 = (uint16_t *)malloc(2 * gu_size * sizeof(uint16_t));
+        if (l->gate_up_fused_bf16) {
+            memcpy(l->gate_up_fused_bf16, l->gate_bf16, gu_size * sizeof(uint16_t));
+            memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
+        }
     }
 
     /* Final norm */
@@ -927,6 +935,7 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         qwen_tts_talker_layer_t *l = &ctx->talker.layers[i];
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
+        free(l->gate_up_fused_bf16);
     }
 
     /* Free subtalker LOAD_F32'd weights (norms + biases) */
@@ -936,6 +945,7 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
         qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[i];
         free(l->q_norm_weight); free(l->k_norm_weight);
         free(l->input_norm); free(l->post_attn_norm);
+        free(l->gate_up_fused_bf16);
     }
 
     /* Free KV caches and scratch buffers */

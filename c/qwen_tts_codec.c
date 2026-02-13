@@ -28,6 +28,22 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
+static inline float codec_dot(const float *a, const float *b, int n) {
+#ifdef USE_BLAS
+    return cblas_sdot(n, a, 1, b, 1);
+#else
+    return kernel_dot(a, b, n);
+#endif
+}
+
+static inline void codec_axpy(int n, float alpha, const float *x, float *y) {
+#ifdef USE_BLAS
+    cblas_saxpy(n, alpha, x, 1, y, 1);
+#else
+    for (int i = 0; i < n; i++) y[i] += alpha * x[i];
+#endif
+}
+
 /* ========================================================================
  * RVQ Dequantization
  * ======================================================================== */
@@ -239,6 +255,9 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
     float *k_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
     float *v_all = (float *)malloc((size_t)seq_len * kv_dim * sizeof(float));
     float *attn_out = (float *)malloc((size_t)seq_len * heads * head_dim * sizeof(float));
+    float *attn_scores = (float *)malloc((size_t)seq_len * sizeof(float));
+    float *gate_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
+    float *up_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
 
     for (int layer = 0; layer < layers; layer++) {
         qwen_tts_codec_transformer_layer_t *l = &ctx->codec.transformer_layers[layer];
@@ -276,30 +295,19 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
 
                 /* Compute attention scores within window */
                 int wlen = qi - start + 1;
-                float *scores = (float *)alloca(wlen * sizeof(float));
-                float max_score = -1e30f;
-
-                for (int ki = start; ki <= qi; ki++) {
-                    float *kh = k_all + ki * kv_dim + kv_h * head_dim;
-                    float score = 0;
-                    for (int d = 0; d < head_dim; d++) score += qh[d] * kh[d];
-                    score *= scale;
-                    scores[ki - start] = score;
-                    if (score > max_score) max_score = score;
-                }
-
-                float sum = 0;
                 for (int i = 0; i < wlen; i++) {
-                    scores[i] = expf(scores[i] - max_score);
-                    sum += scores[i];
+                    int ki = start + i;
+                    float *kh = k_all + ki * kv_dim + kv_h * head_dim;
+                    attn_scores[i] = codec_dot(qh, kh, head_dim) * scale;
                 }
-                float inv = 1.0f / sum;
+                kernel_softmax(attn_scores, wlen);
 
                 float *oh = attn_out + qi * heads * head_dim + h * head_dim;
-                for (int ki = start; ki <= qi; ki++) {
-                    float w = scores[ki - start] * inv;
+                for (int i = 0; i < wlen; i++) {
+                    int ki = start + i;
+                    float w = attn_scores[i];
                     float *vh = v_all + ki * kv_dim + kv_h * head_dim;
-                    for (int d = 0; d < head_dim; d++) oh[d] += w * vh[d];
+                    codec_axpy(head_dim, w, vh, oh);
                 }
             }
         }
@@ -325,9 +333,6 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
                            l->post_attn_norm, codec_hidden, eps);
 
         /* MLP: gate + up -> silu -> mul -> down (batch GEMM) */
-        float *gate_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
-        float *up_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
-
         kernel_matmul_f32(gate_all, x_norm, l->gate, seq_len, intermediate, codec_hidden);
         kernel_matmul_f32(up_all, x_norm, l->up, seq_len, intermediate, codec_hidden);
 
@@ -353,8 +358,6 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
                 kernel_mul_inplace(x_norm + t * codec_hidden, l->mlp_layer_scale, codec_hidden);
             kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
         }
-        free(gate_all);
-        free(up_all);
     }
 
     /* Final norm */
@@ -383,7 +386,8 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
     }
 
     free(x); free(x_norm); free(q_all); free(k_all); free(v_all);
-    free(attn_out); free(rope_cos); free(rope_sin);
+    free(attn_out); free(attn_scores); free(gate_all); free(up_all);
+    free(rope_cos); free(rope_sin);
 }
 
 /* ========================================================================
