@@ -40,6 +40,7 @@ static void usage(const char *prog) {
         "  --max-tokens <n>             Max codec tokens to generate (default: 4096)\n"
         "  --subtalker-temperature <f>  Sub-talker temperature (default: 0.9)\n"
         "  --subtalker-top-k <n>        Sub-talker top-K (default: 50)\n"
+        "  --subtalker-top-p <f>        Sub-talker top-P (default: 1.0)\n"
         "\n"
         "Token format:\n"
         "  Token IDs should follow the Qwen2 chat template:\n"
@@ -102,6 +103,7 @@ int main(int argc, char **argv) {
     int top_k = -1;
     int subtalker_top_k = -1;
     float top_p = -1;
+    float subtalker_top_p = -1;
     float repetition_penalty = -1;
     int max_tokens = -1;
 
@@ -135,6 +137,8 @@ int main(int argc, char **argv) {
             subtalker_temperature = strtof(argv[++i], NULL);
         } else if (strcmp(argv[i], "--subtalker-top-k") == 0 && i + 1 < argc) {
             subtalker_top_k = (int)strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--subtalker-top-p") == 0 && i + 1 < argc) {
+            subtalker_top_p = strtof(argv[++i], NULL);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -184,6 +188,7 @@ int main(int argc, char **argv) {
     if (top_k >= 0)                ctx->top_k = top_k;
     if (subtalker_top_k >= 0)      ctx->subtalker_top_k = subtalker_top_k;
     if (top_p >= 0)                ctx->top_p = top_p;
+    if (subtalker_top_p >= 0)      ctx->subtalker_top_p = subtalker_top_p;
     if (repetition_penalty >= 0)   ctx->repetition_penalty = repetition_penalty;
     if (max_tokens >= 0)           ctx->max_new_tokens = max_tokens;
 

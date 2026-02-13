@@ -2,10 +2,10 @@
 
 ## P0 - Correctness (must fix before trusting perf numbers)
 
-- [ ] Fix talker `head_dim` handling to use config value (`talker_config.head_dim`) end-to-end.
-- [ ] Audit talker attention tensor shapes (`q_proj`, `k_proj`, `v_proj`, `o_proj`) against model safetensor metadata and fail fast on mismatch.
-- [ ] Validate EOS behavior parity with Python for the same prompt/sampling settings (token trace + stop step).
-- [ ] Add regression test that checks C does not always run to `max_tokens` for a standard prompt.
+- [x] Fix talker `head_dim` handling to use config value (`talker_config.head_dim`) end-to-end.
+- [x] Audit talker attention tensor shapes (`q_proj`, `k_proj`, `v_proj`, `o_proj`) against model safetensor metadata and fail fast on mismatch.
+- [x] Validate EOS behavior parity with Python for the same prompt/sampling settings (token trace + stop step).
+- [x] Add regression test that checks C does not always run to `max_tokens` for a standard prompt.
 
 ## P1 - Benchmark quality
 

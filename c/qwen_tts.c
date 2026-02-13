@@ -247,7 +247,10 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     cfg->talker_layers          = jget_int(json, "talker_config.num_hidden_layers", QWEN_TTS_TALKER_LAYERS);
     cfg->talker_heads           = jget_int(json, "talker_config.num_attention_heads", QWEN_TTS_TALKER_HEADS);
     cfg->talker_kv_heads        = jget_int(json, "talker_config.num_key_value_heads", QWEN_TTS_TALKER_KV_HEADS);
-    cfg->talker_head_dim        = cfg->talker_hidden / cfg->talker_heads;
+    cfg->talker_head_dim        = jget_int(json, "talker_config.head_dim", 0);
+    if (cfg->talker_head_dim <= 0 && cfg->talker_heads > 0) {
+        cfg->talker_head_dim = cfg->talker_hidden / cfg->talker_heads;
+    }
     cfg->talker_text_hidden     = jget_int(json, "talker_config.text_hidden_size", QWEN_TTS_TALKER_TEXT_HIDDEN);
     cfg->talker_text_vocab      = jget_int(json, "talker_config.text_vocab_size", QWEN_TTS_TALKER_TEXT_VOCAB);
     cfg->num_code_groups        = jget_int(json, "talker_config.num_code_groups", QWEN_TTS_NUM_CODE_GROUPS);
@@ -281,6 +284,23 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     jparse_speaker_map(json, "talker_config.codec_language_id", &cfg->n_languages, &cfg->language_names, &cfg->language_ids);
 
     free(json);
+
+    /* Basic shape/config sanity checks to avoid silent model mismatch. */
+    if (cfg->talker_heads <= 0 || cfg->talker_kv_heads <= 0 || cfg->talker_head_dim <= 0) {
+        fprintf(stderr, "Error: invalid talker attention config (heads=%d kv_heads=%d head_dim=%d)\n",
+                cfg->talker_heads, cfg->talker_kv_heads, cfg->talker_head_dim);
+        return -1;
+    }
+    if (cfg->talker_heads % cfg->talker_kv_heads != 0) {
+        fprintf(stderr, "Error: talker heads (%d) must be divisible by kv heads (%d)\n",
+                cfg->talker_heads, cfg->talker_kv_heads);
+        return -1;
+    }
+    if (cfg->talker_head_dim > 512 || cfg->subtalker_head_dim > 512) {
+        fprintf(stderr, "Error: unsupported head_dim (talker=%d subtalker=%d, max=512)\n",
+                cfg->talker_head_dim, cfg->subtalker_head_dim);
+        return -1;
+    }
 
     /* ---- Load speech_tokenizer config ---- */
     snprintf(path, sizeof(path), "%s/speech_tokenizer/config.json", ctx->model_dir);
@@ -354,11 +374,59 @@ static int load_config(qwen_tts_ctx_t *ctx) {
     if (!dst && qwen_tts_verbose >= 2) fprintf(stderr, "  Warning: tensor not found: %s\n", name); \
 } while(0)
 
+static int expect_tensor_bf16_2d(const multi_safetensors_t *ms, const char *name,
+                                 int64_t dim0, int64_t dim1) {
+    void *data = NULL;
+    const safetensor_t *t = multi_safetensors_find(ms, name, &data);
+    if (!t || !data) {
+        fprintf(stderr, "Error: missing required tensor: %s\n", name);
+        return -1;
+    }
+    if (!t->dtype || strcmp(t->dtype, "BF16") != 0) {
+        fprintf(stderr, "Error: tensor %s dtype mismatch: expected BF16, got %s\n",
+                name, t->dtype ? t->dtype : "(null)");
+        return -1;
+    }
+    if (t->ndim != 2 || t->shape[0] != dim0 || t->shape[1] != dim1) {
+        fprintf(stderr,
+                "Error: tensor %s shape mismatch: expected [%lld, %lld], got [%lld, %lld]\n",
+                name,
+                (long long)dim0, (long long)dim1,
+                (long long)(t->ndim > 0 ? t->shape[0] : -1),
+                (long long)(t->ndim > 1 ? t->shape[1] : -1));
+        return -1;
+    }
+    return 0;
+}
+
+static int validate_talker_attention_shapes(const multi_safetensors_t *ms,
+                                            const qwen_tts_config_t *cfg,
+                                            int layer_idx) {
+    char name[512];
+    int64_t q_out = (int64_t)cfg->talker_heads * cfg->talker_head_dim;
+    int64_t kv_out = (int64_t)cfg->talker_kv_heads * cfg->talker_head_dim;
+    int64_t hidden = cfg->talker_hidden;
+
+    snprintf(name, sizeof(name), "talker.model.layers.%d.self_attn.q_proj.weight", layer_idx);
+    if (expect_tensor_bf16_2d(ms, name, q_out, hidden) != 0) return -1;
+
+    snprintf(name, sizeof(name), "talker.model.layers.%d.self_attn.k_proj.weight", layer_idx);
+    if (expect_tensor_bf16_2d(ms, name, kv_out, hidden) != 0) return -1;
+
+    snprintf(name, sizeof(name), "talker.model.layers.%d.self_attn.v_proj.weight", layer_idx);
+    if (expect_tensor_bf16_2d(ms, name, kv_out, hidden) != 0) return -1;
+
+    snprintf(name, sizeof(name), "talker.model.layers.%d.self_attn.o_proj.weight", layer_idx);
+    if (expect_tensor_bf16_2d(ms, name, hidden, q_out) != 0) return -1;
+
+    return 0;
+}
+
 /* ========================================================================
  * Load Talker Weights
  * ======================================================================== */
 
-static void load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *ms) {
+static int load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *ms) {
     qwen_tts_config_t *cfg = &ctx->config;
     char name[512];
 
@@ -377,6 +445,8 @@ static void load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *
     /* Transformer layers */
     for (int i = 0; i < cfg->talker_layers; i++) {
         qwen_tts_talker_layer_t *l = &ctx->talker.layers[i];
+
+        if (validate_talker_attention_shapes(ms, cfg, i) != 0) return -1;
 
         snprintf(name, sizeof(name), "talker.model.layers.%d.self_attn.q_proj.weight", i);
         GET_BF16_CHECK(l->wq_bf16, ms, name);
@@ -412,6 +482,7 @@ static void load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *
     GET_BF16_CHECK(ctx->talker.codec_head_bf16, ms, "talker.codec_head.weight");
 
     if (qwen_tts_verbose >= 1) fprintf(stderr, "  Talker: %d layers loaded\n", cfg->talker_layers);
+    return 0;
 }
 
 /* ========================================================================
@@ -753,7 +824,10 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     }
     ctx->safetensors = ms;
 
-    load_talker_weights(ctx, ms);
+    if (load_talker_weights(ctx, ms) != 0) {
+        qwen_tts_free(ctx);
+        return NULL;
+    }
     load_subtalker_weights(ctx, ms);
 
     /* Open codec decoder safetensors */
@@ -1101,6 +1175,8 @@ float *qwen_tts_generate(
     int *all_codes = (int *)calloc((size_t)max_tokens * num_groups, sizeof(int));
     int *generated_tokens = (int *)calloc(max_tokens, sizeof(int));
     int n_generated = 0;
+    int stop_reason = 0; /* 1: eos, 2: max_tokens */
+    int stop_step = max_tokens;
 
     float *logits = (float *)malloc(cfg->talker_vocab_size * sizeof(float));
     float *next_embed = (float *)malloc(hidden * sizeof(float));
@@ -1152,6 +1228,8 @@ float *qwen_tts_generate(
 
         /* Check for EOS */
         if (token == cfg->codec_eos_id) {
+            stop_reason = 1;
+            stop_step = step;
             if (qwen_tts_verbose >= 1)
                 fprintf(stderr, "EOS at step %d\n", step);
             break;
@@ -1200,6 +1278,11 @@ float *qwen_tts_generate(
         }
     }
 
+    if (stop_reason == 0) {
+        stop_reason = 2;
+        stop_step = max_tokens;
+    }
+
     double t_gen_done = time_ms();
     ctx->perf_talker_ms = t_gen_done - t_gen;
     ctx->perf_codec_tokens = n_generated;
@@ -1209,6 +1292,15 @@ float *qwen_tts_generate(
         fprintf(stderr, "Generated %d codec tokens in %.1f ms (%.1f ms/token)\n",
                 n_generated, ctx->perf_talker_ms,
                 n_generated > 0 ? ctx->perf_talker_ms / n_generated : 0);
+        fprintf(stderr, "Stop: %s at step %d\n",
+                stop_reason == 1 ? "eos" : "max_tokens", stop_step);
+        if (qwen_tts_verbose >= 2) {
+            fprintf(stderr, "Token trace:");
+            for (int i = 0; i < n_generated; i++) {
+                fprintf(stderr, "%s%d", i == 0 ? " " : ",", generated_tokens[i]);
+            }
+            fprintf(stderr, "\n");
+        }
     }
 
     free(logits); free(generated_tokens); free(suppress_tokens); free(emb_tmp);

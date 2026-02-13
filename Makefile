@@ -21,8 +21,10 @@ BIN = qwen-tts
 # Prefer python3.11 when available (commonly where torch is installed).
 PYTHON           ?= $(shell command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || echo python3)
 BENCH_SCRIPT     ?= scripts/benchmark_py_vs_c.py
+EOS_PARITY_SCRIPT ?= scripts/validate_eos_parity.py
 BENCH_OUTPUT_DIR ?= benchmark_output
 BENCH_TEXT       ?= Hello from Qwen3-TTS benchmark. porting done by Muonium AI Studios
+EOS_TEXT         ?= With great power comes great responsibility.
 BENCH_LANGUAGE   ?= English
 BENCH_SPEAKER    ?=
 BENCH_RUNS       ?= 3
@@ -38,6 +40,8 @@ BENCH_REP_PEN    ?= 1.05
 BENCH_SUB_TEMP   ?= 0.9
 BENCH_SUB_TOP_K  ?= 50
 BENCH_SUB_TOP_P  ?= 1.0
+EOS_TEST_SCRIPT  ?= test/test_eos_regression.py
+EOS_MAX_TOKENS   ?= 256
 # Default local model path (downloaded by this repo workflow)
 MODEL_DIR        ?= tmp/model
 PYTHON_MODEL     ?= $(MODEL_DIR)
@@ -156,6 +160,45 @@ benchmark: all
 setup-benchmark:
 	$(PYTHON) -m pip install -e .
 
+.PHONY: validate-eos
+validate-eos: all
+	@test -n "$(PYTHON_MODEL)" || (echo "Error: set PYTHON_MODEL or MODEL_DIR"; exit 1)
+	@test -n "$(C_MODEL_DIR)" || (echo "Error: set C_MODEL_DIR or MODEL_DIR"; exit 1)
+	@test -d "$(PYTHON_MODEL)" || (echo "Error: model directory not found: $(PYTHON_MODEL)"; exit 1)
+	@test -d "$(C_MODEL_DIR)" || (echo "Error: model directory not found: $(C_MODEL_DIR)"; exit 1)
+	@$(PYTHON) -c "import torch, transformers" >/dev/null 2>&1 || \
+		(echo "Error: $(PYTHON) is missing validation dependencies (torch/transformers)."; \
+		 echo "Run: make setup-benchmark PYTHON=$(PYTHON)"; exit 1)
+	$(PYTHON) $(EOS_PARITY_SCRIPT) \
+		--python-model "$(PYTHON_MODEL)" \
+		--c-model-dir "$(C_MODEL_DIR)" \
+		--tokenizer "$(TOKENIZER_PATH)" \
+		--c-bin "./$(BIN)" \
+		--text "$(EOS_TEXT)" \
+		--language "$(BENCH_LANGUAGE)" \
+		--speaker "$(BENCH_SPEAKER)" \
+		--python-device "$(BENCH_DEVICE)" \
+		--python-dtype "$(BENCH_DTYPE)" \
+		--max-new-tokens "$(EOS_MAX_TOKENS)" \
+		--top-k "1" \
+		--top-p "1.0" \
+		--temperature "1.0" \
+		--repetition-penalty "1.0" \
+		--subtalker-top-k "1" \
+		--subtalker-top-p "1.0" \
+		--subtalker-temperature "1.0"
+
+.PHONY: test-eos-regression
+test-eos-regression: all
+	@test -n "$(C_MODEL_DIR)" || (echo "Error: set C_MODEL_DIR or MODEL_DIR"; exit 1)
+	@test -d "$(C_MODEL_DIR)" || (echo "Error: model directory not found: $(C_MODEL_DIR)"; exit 1)
+	$(PYTHON) $(EOS_TEST_SCRIPT) \
+		--c-bin "./$(BIN)" \
+		--model-dir "$(C_MODEL_DIR)" \
+		--language "$(BENCH_LANGUAGE)" \
+		--speaker "$(BENCH_SPEAKER)" \
+		--max-tokens "$(EOS_MAX_TOKENS)"
+
 $(BIN): $(SRCS) c/qwen_tts.h c/qwen_tts_kernels.h c/qwen_tts_safetensors.h
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(LDFLAGS)
 
@@ -172,6 +215,8 @@ help:
 	@echo "  make debug    Build with debug symbols + AddressSanitizer"
 	@echo "  make setup-benchmark Install Python benchmark dependencies into $(PYTHON)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
+	@echo "  make validate-eos Validate Python/C EOS stop parity (deterministic decode)"
+	@echo "  make test-eos-regression Assert C stops before max_tokens on standard prompt"
 	@echo "  make clean    Remove build artifacts"
 	@echo "  make help     Show this help"
 	@echo ""

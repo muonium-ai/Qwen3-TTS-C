@@ -182,6 +182,8 @@ On Apple M-series Macs with Accelerate, expect roughly real-time generation. The
 
 ```bash
 make benchmark BENCH_RUNS=1 BENCH_WARMUP=0 BENCH_MAX_TOKENS=128
+make validate-eos BENCH_SPEAKER=aiden
+make test-eos-regression BENCH_SPEAKER=aiden
 ```
 
 ## Known Issues
