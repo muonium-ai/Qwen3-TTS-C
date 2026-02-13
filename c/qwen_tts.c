@@ -500,6 +500,14 @@ static void build_codec_codebook_embeddings(qwen_tts_codebook_t *cb, int codeboo
     }
 }
 
+static void preprocess_snakebeta_params(float *alpha, float *beta, int n) {
+    if (!alpha || !beta) return;
+    for (int i = 0; i < n; i++) {
+        alpha[i] = expf(alpha[i]);
+        beta[i] = 1.0f / (expf(beta[i]) + 1e-9f);
+    }
+}
+
 static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *ms) {
     qwen_tts_config_t *cfg = &ctx->config;
     qwen_tts_codec_decoder_t *codec = &ctx->codec;
@@ -622,6 +630,7 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         LOAD_F32_CHECK(vb->act_alpha, ms, name);
         snprintf(name, sizeof(name), "decoder.decoder.%d.block.0.beta", idx);
         LOAD_F32_CHECK(vb->act_beta, ms, name);
+        preprocess_snakebeta_params(vb->act_alpha, vb->act_beta, cfg->codec_decoder_dim >> b);
 
         /* Transposed conv at block[1] */
         snprintf(name, sizeof(name), "decoder.decoder.%d.block.1.conv.weight", idx);
@@ -638,6 +647,7 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
             LOAD_F32_CHECK(ru->act1_alpha, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act1.beta", idx, ridx);
             LOAD_F32_CHECK(ru->act1_beta, ms, name);
+            preprocess_snakebeta_params(ru->act1_alpha, ru->act1_beta, cfg->codec_decoder_dim >> (b + 1));
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv1.conv.weight", idx, ridx);
             LOAD_F32_CHECK(ru->conv1_weight, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv1.conv.bias", idx, ridx);
@@ -646,6 +656,7 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
             LOAD_F32_CHECK(ru->act2_alpha, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.act2.beta", idx, ridx);
             LOAD_F32_CHECK(ru->act2_beta, ms, name);
+            preprocess_snakebeta_params(ru->act2_alpha, ru->act2_beta, cfg->codec_decoder_dim >> (b + 1));
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv2.conv.weight", idx, ridx);
             LOAD_F32_CHECK(ru->conv2_weight, ms, name);
             snprintf(name, sizeof(name), "decoder.decoder.%d.block.%d.conv2.conv.bias", idx, ridx);
@@ -656,6 +667,8 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
     /* Final SnakeBeta + Conv (decoder.decoder.5 and decoder.decoder.6) */
     LOAD_F32_CHECK(codec->vocoder_final_act_alpha, ms, "decoder.decoder.5.alpha");
     LOAD_F32_CHECK(codec->vocoder_final_act_beta, ms, "decoder.decoder.5.beta");
+    preprocess_snakebeta_params(codec->vocoder_final_act_alpha, codec->vocoder_final_act_beta,
+                                cfg->codec_decoder_dim / 16);
     LOAD_F32_CHECK(codec->vocoder_final_conv_weight, ms, "decoder.decoder.6.conv.weight");
     LOAD_F32_CHECK(codec->vocoder_final_conv_bias, ms, "decoder.decoder.6.conv.bias");
 

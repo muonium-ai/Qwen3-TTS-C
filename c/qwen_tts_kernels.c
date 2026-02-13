@@ -228,13 +228,14 @@ void kernel_gelu_inplace(float *x, int n) {
 
 void kernel_snake_beta(float *out, const float *x, const float *alpha,
                        const float *beta, int channels, int length) {
-    /* SnakeBeta: out = x + (1/beta) * sin^2(alpha * x) */
-    /* alpha and beta are stored as log values (need exp) */
-    const float eps = 1e-9f;
+    /* SnakeBeta: out = x + inv_beta * sin^2(alpha * x)
+     * alpha/beta are preprocessed at load time:
+     *   alpha = exp(alpha_log)
+     *   beta = 1 / (exp(beta_log) + eps)
+     */
     for (int c = 0; c < channels; c++) {
-        float a = expf(alpha[c]);
-        float b = expf(beta[c]);
-        float inv_b = 1.0f / (b + eps);
+        float a = alpha[c];
+        float inv_b = beta[c];
         for (int t = 0; t < length; t++) {
             int idx = c * length + t;
             float s = sinf(x[idx] * a);

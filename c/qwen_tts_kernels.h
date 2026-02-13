@@ -60,7 +60,8 @@ void kernel_silu_inplace(float *x, int n);
 /* GELU activation */
 void kernel_gelu_inplace(float *x, int n);
 
-/* SnakeBeta activation: x + (1/beta) * sin^2(alpha * x) */
+/* SnakeBeta activation: x + inv_beta * sin^2(alpha * x)
+ * alpha/inv_beta are preprocessed at model load time. */
 void kernel_snake_beta(float *out, const float *x, const float *alpha,
                        const float *beta, int channels, int length);
 
