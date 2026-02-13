@@ -9,11 +9,19 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <errno.h>
 
 int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, int sample_rate) {
-    FILE *f = fopen(path, "wb");
+    char tmp_path[4096];
+    int n = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    if (n < 0 || n >= (int)sizeof(tmp_path)) {
+        fprintf(stderr, "Error: output path too long: %s\n", path);
+        return -1;
+    }
+
+    FILE *f = fopen(tmp_path, "wb");
     if (!f) {
-        fprintf(stderr, "Error: cannot open %s for writing\n", path);
+        fprintf(stderr, "Error: cannot open %s for writing\n", tmp_path);
         return -1;
     }
 
@@ -52,7 +60,12 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
     uint32_t ds = (uint32_t)data_size;
     memcpy(header + 40, &ds, 4);
 
-    fwrite(header, 1, 44, f);
+    if (fwrite(header, 1, 44, f) != 44) {
+        fprintf(stderr, "Error: failed to write WAV header to %s\n", tmp_path);
+        fclose(f);
+        remove(tmp_path);
+        return -1;
+    }
 
     /* Convert float32 [-1, 1] to int16 */
     for (int i = 0; i < n_samples; i++) {
@@ -60,9 +73,25 @@ int qwen_tts_write_wav(const char *path, const float *samples, int n_samples, in
         if (s > 1.0f) s = 1.0f;
         if (s < -1.0f) s = -1.0f;
         int16_t sample = (int16_t)(s * 32767.0f);
-        fwrite(&sample, 2, 1, f);
+        if (fwrite(&sample, 2, 1, f) != 1) {
+            fprintf(stderr, "Error: failed to write WAV data to %s\n", tmp_path);
+            fclose(f);
+            remove(tmp_path);
+            return -1;
+        }
     }
 
-    fclose(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "Error: failed to close %s\n", tmp_path);
+        remove(tmp_path);
+        return -1;
+    }
+
+    if (rename(tmp_path, path) != 0) {
+        fprintf(stderr, "Error: failed to rename %s -> %s: %s\n", tmp_path, path, strerror(errno));
+        remove(tmp_path);
+        return -1;
+    }
+
     return 0;
 }

@@ -339,6 +339,83 @@ void kernel_apply_repetition_penalty(float *logits, const int *token_ids,
 
 int kernel_sample_top_k(const float *logits, int vocab_size, int top_k,
                         float top_p, float temperature, float *rng_state) {
+    if (temperature <= 0.0f) temperature = 1e-5f;
+
+    /*
+     * Fast path for the common case in this project:
+     *   - top_k enabled (e.g., 50)
+     *   - top_p disabled (top_p >= 1.0)
+     *
+     * Instead of softmax over the full vocab, keep only top_k logits and
+     * sample from that set.
+     */
+    if (top_p >= 1.0f && top_k > 0 && top_k < vocab_size) {
+        int k = top_k;
+        int top_idx_stack[256];
+        float top_val_stack[256];
+        int *top_idx = top_idx_stack;
+        float *top_val = top_val_stack;
+
+        if (k > 256) {
+            top_idx = (int *)malloc((size_t)k * sizeof(int));
+            top_val = (float *)malloc((size_t)k * sizeof(float));
+        }
+
+        for (int j = 0; j < k; j++) {
+            top_idx[j] = -1;
+            top_val[j] = -FLT_MAX;
+        }
+
+        /* Maintain descending top-k list via insertion. */
+        for (int i = 0; i < vocab_size; i++) {
+            float v = logits[i] / temperature;
+            if (v <= top_val[k - 1]) continue;
+
+            int p = k - 1;
+            while (p > 0 && v > top_val[p - 1]) {
+                top_val[p] = top_val[p - 1];
+                top_idx[p] = top_idx[p - 1];
+                p--;
+            }
+            top_val[p] = v;
+            top_idx[p] = i;
+        }
+
+        /* Softmax over top-k only. */
+        float max_val = top_val[0];
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) {
+            if (top_idx[j] < 0) {
+                top_val[j] = 0.0f;
+                continue;
+            }
+            float p = expf(top_val[j] - max_val);
+            top_val[j] = p;
+            sum += p;
+        }
+
+        int sampled = 0;
+        if (sum > 0.0f) {
+            float r = rand_uniform(rng_state) * sum;
+            float cumsum = 0.0f;
+            for (int j = 0; j < k; j++) {
+                cumsum += top_val[j];
+                if (cumsum >= r) {
+                    sampled = top_idx[j] >= 0 ? top_idx[j] : 0;
+                    break;
+                }
+            }
+        } else {
+            sampled = top_idx[0] >= 0 ? top_idx[0] : 0;
+        }
+
+        if (k > 256) {
+            free(top_idx);
+            free(top_val);
+        }
+        return sampled;
+    }
+
     /* Apply temperature */
     float *probs = (float *)malloc(vocab_size * sizeof(float));
     for (int i = 0; i < vocab_size; i++) probs[i] = logits[i] / temperature;

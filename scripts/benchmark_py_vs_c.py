@@ -14,9 +14,11 @@ import argparse
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import wave
 from dataclasses import asdict, dataclass
@@ -201,7 +203,15 @@ def _bench_c(
         raise FileNotFoundError(f"C binary not found: {c_bin}")
 
     def run_once(save_path: Path | None) -> RunResult:
-        output_wav = save_path or (out_dir / "_tmp_c.wav")
+        tmp_wav_path: Path | None = None
+        if save_path is not None:
+            output_wav = save_path
+        else:
+            fd, tmp_name = tempfile.mkstemp(prefix="bench_c_", suffix=".wav", dir=str(out_dir))
+            os.close(fd)
+            tmp_wav_path = Path(tmp_name)
+            output_wav = tmp_wav_path
+
         cmd = [
             str(c_bin),
             "-d",
@@ -239,6 +249,13 @@ def _bench_c(
         rtf = audio_sec / (elapsed_ms / 1000.0) if elapsed_ms > 0 else 0.0
 
         internal_ms = _parse_c_internal_total_ms(proc.stderr)
+
+        if tmp_wav_path is not None:
+            try:
+                tmp_wav_path.unlink()
+            except FileNotFoundError:
+                pass
+
         return RunResult(
             elapsed_ms=elapsed_ms,
             audio_sec=audio_sec,
@@ -348,8 +365,10 @@ def main() -> int:
     print(f"[setup] python_model={args.python_model}")
     print(f"[setup] c_model_dir={args.c_model_dir}")
     print(f"[setup] runs={args.runs}, warmup_runs={args.warmup_runs}")
+    if shutil.which("sox") is None:
+        print("[setup] warning: sox binary not found; install via `brew install sox` to remove SoX warnings.")
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, fix_mistral_regex=True)
     token_ids = tokenizer(_chat_template(args.text), return_tensors="pt").input_ids[0].tolist()
     token_id_str = ",".join(str(x) for x in token_ids)
     print(f"[setup] prompt tokens={len(token_ids)}")
