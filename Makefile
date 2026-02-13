@@ -21,7 +21,7 @@ BIN = qwen-tts
 PYTHON           ?= python3
 BENCH_SCRIPT     ?= scripts/benchmark_py_vs_c.py
 BENCH_OUTPUT_DIR ?= benchmark_output
-BENCH_TEXT       ?= Hello from Qwen3-TTS benchmark.
+BENCH_TEXT       ?= Hello from Qwen3-TTS benchmark. porting done by Muonium AI Studios
 BENCH_LANGUAGE   ?= English
 BENCH_SPEAKER    ?=
 BENCH_RUNS       ?= 3
@@ -36,6 +36,7 @@ BENCH_TEMP       ?= 0.9
 BENCH_REP_PEN    ?= 1.05
 BENCH_SUB_TEMP   ?= 0.9
 BENCH_SUB_TOP_K  ?= 50
+BENCH_SUB_TOP_P  ?= 1.0
 MODEL_DIR        ?=
 PYTHON_MODEL     ?= $(MODEL_DIR)
 C_MODEL_DIR      ?= $(MODEL_DIR)
@@ -113,6 +114,7 @@ benchmark: all
 		--repetition-penalty "$(BENCH_REP_PEN)" \
 		--subtalker-temperature "$(BENCH_SUB_TEMP)" \
 		--subtalker-top-k "$(BENCH_SUB_TOP_K)" \
+		--subtalker-top-p "$(BENCH_SUB_TOP_P)" \
 		--output-dir "$(BENCH_OUTPUT_DIR)"
 
 $(BIN): $(SRCS) c/qwen_tts.h c/qwen_tts_kernels.h c/qwen_tts_safetensors.h

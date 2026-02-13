@@ -196,7 +196,7 @@ def _bench_c(
     token_ids: str,
     speaker: str,
 ) -> tuple[dict[str, Any], float]:
-    c_bin = Path(args.c_bin)
+    c_bin = Path(args.c_bin).resolve()
     if not c_bin.exists():
         raise FileNotFoundError(f"C binary not found: {c_bin}")
 
@@ -312,6 +312,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repetition-penalty", type=float, default=1.05)
     parser.add_argument("--subtalker-temperature", type=float, default=0.9)
     parser.add_argument("--subtalker-top-k", type=int, default=50)
+    parser.add_argument("--subtalker-top-p", type=float, default=1.0)
     parser.add_argument("--max-new-tokens", type=int, default=512)
 
     parser.add_argument("--output-dir", default="benchmark_output")
@@ -382,6 +383,7 @@ def main() -> int:
             "repetition_penalty": args.repetition_penalty,
             "subtalker_temperature": args.subtalker_temperature,
             "subtalker_top_k": args.subtalker_top_k,
+            "subtalker_top_p": args.subtalker_top_p,
             "max_new_tokens": args.max_new_tokens,
         },
         "python": py_summary,
