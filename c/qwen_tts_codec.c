@@ -457,9 +457,7 @@ static void codec_convnext_forward(qwen_tts_convnext_block_t *block,
 
 typedef struct {
     float *residual;
-    float *act1;
     float *conv1_out;
-    float *act2;
     size_t cap;
 } vocoder_resunit_scratch_t;
 
@@ -470,17 +468,9 @@ static int ensure_vocoder_resunit_scratch(vocoder_resunit_scratch_t *s, size_t n
     if (!p) return -1;
     s->residual = p;
 
-    p = (float *)realloc(s->act1, n * sizeof(float));
-    if (!p) return -1;
-    s->act1 = p;
-
     p = (float *)realloc(s->conv1_out, n * sizeof(float));
     if (!p) return -1;
     s->conv1_out = p;
-
-    p = (float *)realloc(s->act2, n * sizeof(float));
-    if (!p) return -1;
-    s->act2 = p;
 
     s->cap = n;
     return 0;
@@ -492,23 +482,21 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
     size_t n = (size_t)dim * length;
     if (ensure_vocoder_resunit_scratch(scratch, n) != 0) return -1;
     float *residual = scratch->residual;
-    float *act1 = scratch->act1;
     float *conv1_out = scratch->conv1_out;
-    float *act2 = scratch->act2;
     memcpy(residual, hidden, n * sizeof(float));
 
-    /* SnakeBeta activation 1 */
-    kernel_snake_beta(act1, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
+    /* SnakeBeta activation 1 (in-place) */
+    kernel_snake_beta(hidden, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
 
     /* Causal conv1 (k=7, dilation) */
-    kernel_causal_conv1d(conv1_out, act1, unit->conv1_weight, unit->conv1_bias,
+    kernel_causal_conv1d(conv1_out, hidden, unit->conv1_weight, unit->conv1_bias,
                          dim, dim, 7, length, dilation, 1);
 
-    /* SnakeBeta activation 2 */
-    kernel_snake_beta(act2, conv1_out, unit->act2_alpha, unit->act2_beta, dim, length);
+    /* SnakeBeta activation 2 (in-place) */
+    kernel_snake_beta(conv1_out, conv1_out, unit->act2_alpha, unit->act2_beta, dim, length);
 
     /* Causal conv2 (k=1, dilation=1) */
-    kernel_causal_conv1d(hidden, act2, unit->conv2_weight, unit->conv2_bias,
+    kernel_causal_conv1d(hidden, conv1_out, unit->conv2_weight, unit->conv2_bias,
                          dim, dim, 1, length, 1, 1);
 
     /* Skip connection */
@@ -609,8 +597,6 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         cfg->codec_upsample_rates[3],
     };
     int current_dim = decoder_dim;
-    float *activated = NULL;
-    size_t activated_cap = 0;
     vocoder_resunit_scratch_t ru_scratch = {0};
 
     for (int block = 0; block < 4; block++) {
@@ -619,30 +605,14 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         int rate = upsample_rates[block];
         qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
 
-        /* SnakeBeta activation */
-        size_t act_need = (size_t)in_dim * current_len;
-        if (activated_cap < act_need) {
-            float *new_activated = (float *)realloc(activated, act_need * sizeof(float));
-            if (!new_activated) {
-                free(activated);
-                free(voc);
-                free(ru_scratch.residual);
-                free(ru_scratch.act1);
-                free(ru_scratch.conv1_out);
-                free(ru_scratch.act2);
-                *out_samples = 0;
-                return NULL;
-            }
-            activated = new_activated;
-            activated_cap = act_need;
-        }
-        kernel_snake_beta(activated, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
+        /* SnakeBeta activation (in-place) */
+        kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
 
         /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
         int new_len;
         int kernel = 2 * rate;
         float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
-        kernel_transposed_conv1d(transconv_out, activated, vb->transconv_weight, vb->transconv_bias,
+        kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
                                   in_dim, out_dim, kernel, rate, current_len, &new_len);
         free(voc);
 
@@ -655,12 +625,9 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         for (int ru = 0; ru < 3; ru++) {
             if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
                                         dilations[ru], &ru_scratch) != 0) {
-                free(activated);
                 free(voc);
                 free(ru_scratch.residual);
-                free(ru_scratch.act1);
                 free(ru_scratch.conv1_out);
-                free(ru_scratch.act2);
                 *out_samples = 0;
                 return NULL;
             }
@@ -668,36 +635,17 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     }
 
     /* 7c. Final: SnakeBeta → CausalConv1d → output channel 1 */
-    size_t final_need = (size_t)current_dim * current_len;
-    if (activated_cap < final_need) {
-        float *new_activated = (float *)realloc(activated, final_need * sizeof(float));
-        if (!new_activated) {
-            free(activated);
-            free(voc);
-            free(ru_scratch.residual);
-            free(ru_scratch.act1);
-            free(ru_scratch.conv1_out);
-            free(ru_scratch.act2);
-            *out_samples = 0;
-            return NULL;
-        }
-        activated = new_activated;
-        activated_cap = final_need;
-    }
-    kernel_snake_beta(activated, voc, ctx->codec.vocoder_final_act_alpha,
+    kernel_snake_beta(voc, voc, ctx->codec.vocoder_final_act_alpha,
                       ctx->codec.vocoder_final_act_beta, current_dim, current_len);
-    free(voc);
 
     /* Final conv: [current_dim, current_len] → [1, current_len] */
     float *wav = (float *)malloc((size_t)current_len * sizeof(float));
-    kernel_causal_conv1d(wav, activated, ctx->codec.vocoder_final_conv_weight,
+    kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
                          ctx->codec.vocoder_final_conv_bias,
                          current_dim, 1, 7, current_len, 1, 1);
-    free(activated);
+    free(voc);
     free(ru_scratch.residual);
-    free(ru_scratch.act1);
     free(ru_scratch.conv1_out);
-    free(ru_scratch.act2);
 
     /* 8. Clamp to [-1, 1] */
     kernel_clamp(wav, current_len, -1.0f, 1.0f);

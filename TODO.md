@@ -20,8 +20,9 @@
 - [x] Vectorize remaining talker attention inner loops (dot + weighted sum) where BLAS is not used.
 - [x] Improve subtalker throughput with better batching/reuse for repeated small matvec calls.
 - [x] Reduce per-step allocator/memory traffic in generation loops.
-- [ ] Investigate codec decoder kernel fusion opportunities after talker parity is stable.
+- [x] Investigate codec decoder kernel fusion opportunities after talker parity is stable.
+  First pass done: in-place SnakeBeta fusion in vocoder blocks/resunits/final stage to remove extra activation buffers.
 
 Latest profile snapshot (2026-02-13, `./qwen-tts -v -v`, deterministic decode):
-- Talker decode: ~11.5s for 74 tokens (~155 ms/token).
-- Codec total: ~4.16s, dominated by vocoder (~3.93s).
+- Talker decode: ~11.2s for 74 tokens (~151 ms/token).
+- Codec total: ~4.16s, dominated by vocoder (~3.90s).
