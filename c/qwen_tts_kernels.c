@@ -525,6 +525,62 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
     int ch_per_group = in_channels / groups;
     int out_per_group = out_channels / groups;
 
+    /* Fast path for pointwise conv: k=1, dilation=1 (very common in vocoder). */
+    if (kernel_size == 1 && dilation == 1) {
+        if (groups == in_channels && in_channels == out_channels) {
+            /* Depthwise pointwise: one scalar multiply per sample. */
+            for (int c = 0; c < in_channels; c++) {
+                float w = weight[c];
+                float b = bias ? bias[c] : 0.0f;
+                const float *in_ch = input + c * length;
+                float *out_ch = out + c * length;
+                for (int t = 0; t < length; t++) {
+                    out_ch[t] = in_ch[t] * w + b;
+                }
+            }
+            return;
+        }
+
+        for (int oc = 0; oc < out_channels; oc++) {
+            int g = oc / out_per_group;
+            const float *w_row = weight + (size_t)oc * ch_per_group;
+            for (int t = 0; t < length; t++) {
+                float sum = bias ? bias[oc] : 0.0f;
+                int ic_base = g * ch_per_group;
+                for (int ic = 0; ic < ch_per_group; ic++) {
+                    sum += w_row[ic] * input[(ic_base + ic) * length + t];
+                }
+                out[oc * length + t] = sum;
+            }
+        }
+        return;
+    }
+
+    /*
+     * Fast path for common causal conv (dilation=1):
+     * avoid inner-boundary checks for the steady-state region.
+     */
+    if (dilation == 1) {
+        for (int oc = 0; oc < out_channels; oc++) {
+            int g = oc / out_per_group;
+            int ic_base = g * ch_per_group;
+            for (int t = 0; t < length; t++) {
+                float sum = bias ? bias[oc] : 0.0f;
+                int k_start = (pad > t) ? (pad - t) : 0;
+                int in_t0 = t - pad + k_start;
+                for (int ic = 0; ic < ch_per_group; ic++) {
+                    const float *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
+                    const float *in = input + (size_t)(ic_base + ic) * length + in_t0;
+                    for (int k = k_start; k < kernel_size; k++) {
+                        sum += w[k] * (*in++);
+                    }
+                }
+                out[oc * length + t] = sum;
+            }
+        }
+        return;
+    }
+
     for (int oc = 0; oc < out_channels; oc++) {
         int g = oc / out_per_group;
         for (int t = 0; t < length; t++) {
@@ -560,29 +616,26 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     int final_len = raw_out_len - right_pad;
     if (final_len < 0) final_len = 0;
 
-    /* Zero output */
-    memset(out, 0, (size_t)out_channels * final_len * sizeof(float));
+    /*
+     * Cache-friendly loop order:
+     *   iterate output channel first so writes stay contiguous in out[oc, :].
+     * Weight layout is [in_channels, out_channels, kernel_size].
+     */
+    for (int oc = 0; oc < out_channels; oc++) {
+        float *out_ch = out + (size_t)oc * final_len;
+        float b = bias ? bias[oc] : 0.0f;
+        for (int t = 0; t < final_len; t++) out_ch[t] = b;
 
-    for (int ic = 0; ic < in_channels; ic++) {
-        for (int t = 0; t < length; t++) {
-            float val = input[ic * length + t];
-            for (int k = 0; k < kernel_size; k++) {
-                int ot = t * stride + k;
-                if (ot < final_len) {
-                    for (int oc = 0; oc < out_channels; oc++) {
-                        int widx = ic * out_channels * kernel_size + oc * kernel_size + k;
-                        out[oc * final_len + ot] += val * weight[widx];
-                    }
+        for (int ic = 0; ic < in_channels; ic++) {
+            const float *in_ch = input + (size_t)ic * length;
+            const float *w = weight + (size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size;
+            for (int t = 0; t < length; t++) {
+                float val = in_ch[t];
+                int base = t * stride;
+                for (int k = 0; k < kernel_size; k++) {
+                    int ot = base + k;
+                    if (ot < final_len) out_ch[ot] += val * w[k];
                 }
-            }
-        }
-    }
-
-    /* Add bias */
-    if (bias) {
-        for (int oc = 0; oc < out_channels; oc++) {
-            for (int t = 0; t < final_len; t++) {
-                out[oc * final_len + t] += bias[oc];
             }
         }
     }

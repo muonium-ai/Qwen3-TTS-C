@@ -179,15 +179,24 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
 
     /* hidden comes as [seq_len, latent] format (already transposed from channels-first) */
 
-    /* Input projection: latent_dim → codec_hidden */
+    /* Input projection: latent_dim -> codec_hidden (batch GEMM) */
     float *x = (float *)malloc((size_t)seq_len * codec_hidden * sizeof(float));
-    for (int t = 0; t < seq_len; t++) {
-        kernel_matvec_f32(x + t * codec_hidden,
-                          ctx->codec.transformer_input_proj_weight,
-                          hidden + t * latent, codec_hidden, latent);
-        if (ctx->codec.transformer_input_proj_bias)
-            kernel_add_inplace(x + t * codec_hidden,
-                              ctx->codec.transformer_input_proj_bias, codec_hidden);
+    kernel_matmul_f32(
+        x,
+        hidden,
+        ctx->codec.transformer_input_proj_weight,
+        seq_len,
+        codec_hidden,
+        latent
+    );
+    if (ctx->codec.transformer_input_proj_bias) {
+        for (int t = 0; t < seq_len; t++) {
+            kernel_add_inplace(
+                x + t * codec_hidden,
+                ctx->codec.transformer_input_proj_bias,
+                codec_hidden
+            );
+        }
     }
 
     /* Compute RoPE cache */
@@ -223,15 +232,10 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->input_norm, codec_hidden, eps);
 
-        /* 2. Q, K, V projections */
-        for (int t = 0; t < seq_len; t++) {
-            kernel_matvec_f32(q_all + t * heads * head_dim, l->wq,
-                             x_norm + t * codec_hidden, heads * head_dim, codec_hidden);
-            kernel_matvec_f32(k_all + t * kv_dim, l->wk,
-                             x_norm + t * codec_hidden, kv_dim, codec_hidden);
-            kernel_matvec_f32(v_all + t * kv_dim, l->wv,
-                             x_norm + t * codec_hidden, kv_dim, codec_hidden);
-        }
+        /* 2. Q, K, V projections (batch GEMM) */
+        kernel_matmul_f32(q_all, x_norm, l->wq, seq_len, heads * head_dim, codec_hidden);
+        kernel_matmul_f32(k_all, x_norm, l->wk, seq_len, kv_dim, codec_hidden);
+        kernel_matmul_f32(v_all, x_norm, l->wv, seq_len, kv_dim, codec_hidden);
 
         /* 3. RoPE (standard, not M-RoPE. No QK-Norm for codec decoder) */
         for (int t = 0; t < seq_len; t++) {
@@ -285,10 +289,15 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
         }
 
         /* 5. Output projection + LayerScale + residual */
+        kernel_matmul_f32(
+            x_norm,
+            attn_out,
+            l->wo,
+            seq_len,
+            codec_hidden,
+            heads * head_dim
+        );
         for (int t = 0; t < seq_len; t++) {
-            kernel_matvec_f32(x_norm + t * codec_hidden, l->wo,
-                             attn_out + t * heads * head_dim, codec_hidden, heads * head_dim);
-            /* LayerScale */
             if (l->attn_layer_scale)
                 kernel_mul_inplace(x_norm + t * codec_hidden, l->attn_layer_scale, codec_hidden);
             kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
@@ -299,21 +308,37 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
                            l->post_attn_norm, codec_hidden, eps);
 
-        /* MLP: gate + up → silu → mul → down */
-        float *gate = (float *)malloc(intermediate * sizeof(float));
-        float *up = (float *)malloc(intermediate * sizeof(float));
+        /* MLP: gate + up -> silu -> mul -> down (batch GEMM) */
+        float *gate_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
+        float *up_all = (float *)malloc((size_t)seq_len * intermediate * sizeof(float));
+
+        kernel_matmul_f32(gate_all, x_norm, l->gate, seq_len, intermediate, codec_hidden);
+        kernel_matmul_f32(up_all, x_norm, l->up, seq_len, intermediate, codec_hidden);
+
         for (int t = 0; t < seq_len; t++) {
-            kernel_matvec_f32(gate, l->gate, x_norm + t * codec_hidden, intermediate, codec_hidden);
-            kernel_matvec_f32(up, l->up, x_norm + t * codec_hidden, intermediate, codec_hidden);
+            float *gate = gate_all + (size_t)t * intermediate;
+            float *up = up_all + (size_t)t * intermediate;
             kernel_silu_inplace(gate, intermediate);
             kernel_mul_inplace(gate, up, intermediate);
-            kernel_matvec_f32(x_norm + t * codec_hidden, l->down, gate, codec_hidden, intermediate);
+        }
+
+        kernel_matmul_f32(
+            x_norm,
+            gate_all,
+            l->down,
+            seq_len,
+            codec_hidden,
+            intermediate
+        );
+
+        for (int t = 0; t < seq_len; t++) {
             /* LayerScale */
             if (l->mlp_layer_scale)
                 kernel_mul_inplace(x_norm + t * codec_hidden, l->mlp_layer_scale, codec_hidden);
             kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
         }
-        free(gate); free(up);
+        free(gate_all);
+        free(up_all);
     }
 
     /* Final norm */
@@ -322,14 +347,23 @@ static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
             kernel_rms_norm_inplace(x + t * codec_hidden, ctx->codec.transformer_norm, codec_hidden, eps);
     }
 
-    /* Output projection: codec_hidden → latent_dim */
-    for (int t = 0; t < seq_len; t++) {
-        kernel_matvec_f32(hidden + t * latent,
-                          ctx->codec.transformer_output_proj_weight,
-                          x + t * codec_hidden, latent, codec_hidden);
-        if (ctx->codec.transformer_output_proj_bias)
-            kernel_add_inplace(hidden + t * latent,
-                              ctx->codec.transformer_output_proj_bias, latent);
+    /* Output projection: codec_hidden -> latent_dim (batch GEMM) */
+    kernel_matmul_f32(
+        hidden,
+        x,
+        ctx->codec.transformer_output_proj_weight,
+        seq_len,
+        latent,
+        codec_hidden
+    );
+    if (ctx->codec.transformer_output_proj_bias) {
+        for (int t = 0; t < seq_len; t++) {
+            kernel_add_inplace(
+                hidden + t * latent,
+                ctx->codec.transformer_output_proj_bias,
+                latent
+            );
+        }
     }
 
     free(x); free(x_norm); free(q_all); free(k_all); free(v_all);

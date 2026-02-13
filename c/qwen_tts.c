@@ -999,6 +999,7 @@ float *qwen_tts_generate(
     float *tts_pad_proj = (float *)malloc(hidden * sizeof(float));
     float *tts_bos_proj = (float *)malloc(hidden * sizeof(float));
     float *tts_eos_proj = (float *)malloc(hidden * sizeof(float));
+    float *codec_emb_tmp = (float *)malloc(hidden * sizeof(float));
     embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_PAD, tts_pad_proj);
     embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_BOS, tts_bos_proj);
     embed_text_token(ctx, QWEN_TTS_TOKEN_TTS_EOS, tts_eos_proj);
@@ -1012,10 +1013,8 @@ float *qwen_tts_generate(
             memcpy(dst, tts_bos_proj, hidden * sizeof(float));
         }
         /* Codec part: add codec_embed(codec_prefix[i]) */
-        float *codec_emb = (float *)malloc(hidden * sizeof(float));
-        embed_codec_token(ctx, codec_prefix[i], codec_emb);
-        kernel_add_inplace(dst, codec_emb, hidden);
-        free(codec_emb);
+        embed_codec_token(ctx, codec_prefix[i], codec_emb_tmp);
+        kernel_add_inplace(dst, codec_emb_tmp, hidden);
     }
 
     /* 3. First text token + codec_bos:
@@ -1025,11 +1024,10 @@ float *qwen_tts_generate(
         int pos = 3 + n_codec_prefix - 1;
         float *dst = input_embeds + pos * hidden;
         embed_text_token(ctx, text_tokens[3], dst);
-        float *codec_emb = (float *)malloc(hidden * sizeof(float));
-        embed_codec_token(ctx, cfg->codec_bos_id, codec_emb);
-        kernel_add_inplace(dst, codec_emb, hidden);
-        free(codec_emb);
+        embed_codec_token(ctx, cfg->codec_bos_id, codec_emb_tmp);
+        kernel_add_inplace(dst, codec_emb_tmp, hidden);
     }
+    free(codec_emb_tmp);
 
     /* Build trailing text embeddings (remaining text + tts_eos) */
     int n_trailing = (n_text_tokens - 4 - 5) + 1;  /* remaining text + eos */
@@ -1061,6 +1059,7 @@ float *qwen_tts_generate(
 
     float *logits = (float *)malloc(cfg->talker_vocab_size * sizeof(float));
     float *next_embed = (float *)malloc(hidden * sizeof(float));
+    float *emb_tmp = (float *)malloc(hidden * sizeof(float));
     float rng_state = 42.0f;
 
     /* Suppress tokens: [vocab-1024, vocab) except EOS */
@@ -1129,7 +1128,6 @@ float *qwen_tts_generate(
         memset(next_embed, 0, hidden * sizeof(float));
 
         /* Group 0: talker codec embedding */
-        float *emb_tmp = (float *)malloc(hidden * sizeof(float));
         embed_codec_token(ctx, token, emb_tmp);
         kernel_add_inplace(next_embed, emb_tmp, hidden);
 
@@ -1140,8 +1138,6 @@ float *qwen_tts_generate(
                                (size_t)codes[g] * emb_dim, emb_dim);
             kernel_add_inplace(next_embed, emb_tmp, hidden);
         }
-        free(emb_tmp);
-
         /* Add trailing text embedding */
         if (step < n_trailing) {
             kernel_add_inplace(next_embed, trailing_text + step * hidden, hidden);
@@ -1170,7 +1166,7 @@ float *qwen_tts_generate(
                 n_generated > 0 ? ctx->perf_talker_ms / n_generated : 0);
     }
 
-    free(logits); free(generated_tokens); free(suppress_tokens);
+    free(logits); free(generated_tokens); free(suppress_tokens); free(emb_tmp);
     free(trailing_text); free(tts_pad_proj); free(tts_bos_proj); free(tts_eos_proj);
     free(text_tokens);
 
