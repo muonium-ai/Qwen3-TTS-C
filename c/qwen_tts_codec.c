@@ -18,8 +18,15 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern int qwen_tts_verbose;
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 /* ========================================================================
  * RVQ Dequantization
@@ -67,14 +74,18 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
     /* Process semantic codebook (quantizer 0) */
     {
         qwen_tts_codebook_t *cb = &rvq->semantic_codebooks[0];
-        /* Compute actual embeddings: embedding_sum / cluster_usage */
-        float *embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
-        for (int c = 0; c < codebook_size; c++) {
-            float usage = cb->cluster_usage[c];
-            if (usage < 1e-5f) usage = 1e-5f;
-            float inv_usage = 1.0f / usage;
-            for (int d = 0; d < vq_dim; d++) {
-                embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+        const float *embeddings = cb->embeddings;
+        float *tmp_embeddings = NULL;
+        if (!embeddings) {
+            tmp_embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
+            embeddings = tmp_embeddings;
+            for (int c = 0; c < codebook_size; c++) {
+                float usage = cb->cluster_usage[c];
+                if (usage < 1e-5f) usage = 1e-5f;
+                float inv_usage = 1.0f / usage;
+                for (int d = 0; d < vq_dim; d++) {
+                    tmp_embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+                }
             }
         }
 
@@ -87,7 +98,7 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
                 semantic_sum[d * time_steps + t] += embeddings[code * vq_dim + d];
             }
         }
-        free(embeddings);
+        free(tmp_embeddings);
     }
 
     /* Apply semantic output_proj: Conv1d(vq_dim, half_latent, 1, bias=False) */
@@ -110,13 +121,18 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
     /* Process acoustic codebooks (quantizers 1..num_quantizers-1) */
     for (int q = 1; q < num_quantizers; q++) {
         qwen_tts_codebook_t *cb = &rvq->acoustic_codebooks[q - 1];
-        float *embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
-        for (int c = 0; c < codebook_size; c++) {
-            float usage = cb->cluster_usage[c];
-            if (usage < 1e-5f) usage = 1e-5f;
-            float inv_usage = 1.0f / usage;
-            for (int d = 0; d < vq_dim; d++) {
-                embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+        const float *embeddings = cb->embeddings;
+        float *tmp_embeddings = NULL;
+        if (!embeddings) {
+            tmp_embeddings = (float *)malloc((size_t)codebook_size * vq_dim * sizeof(float));
+            embeddings = tmp_embeddings;
+            for (int c = 0; c < codebook_size; c++) {
+                float usage = cb->cluster_usage[c];
+                if (usage < 1e-5f) usage = 1e-5f;
+                float inv_usage = 1.0f / usage;
+                for (int d = 0; d < vq_dim; d++) {
+                    tmp_embeddings[c * vq_dim + d] = cb->embedding_sum[c * vq_dim + d] * inv_usage;
+                }
             }
         }
         for (int t = 0; t < time_steps; t++) {
@@ -127,7 +143,7 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
                 acoustic_sum[d * time_steps + t] += embeddings[code * vq_dim + d];
             }
         }
-        free(embeddings);
+        free(tmp_embeddings);
     }
 
     /* Apply acoustic output_proj */
@@ -477,15 +493,25 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Codec decode: %d timesteps, %d quantizers\n", time_steps, num_quantizers);
 
+    double stage_t0 = now_ms();
+    double stage_rvq_ms = 0.0;
+    double stage_preconv_ms = 0.0;
+    double stage_transformer_ms = 0.0;
+    double stage_upsample_ms = 0.0;
+    double stage_vocoder_ms = 0.0;
+
     /* 1. RVQ Dequantize → [codebook_dim, time_steps] */
     float *hidden = codec_rvq_dequantize(ctx, codes, time_steps, num_quantizers);
+    stage_rvq_ms = now_ms() - stage_t0;
 
     /* 2. Pre-conv: CausalConv1d(codebook_dim=512, latent_dim=1024, k=3) */
+    stage_t0 = now_ms();
     float *pre_conv_out = (float *)malloc((size_t)latent_dim * time_steps * sizeof(float));
     kernel_causal_conv1d(pre_conv_out, hidden, ctx->codec.pre_conv_weight,
                          ctx->codec.pre_conv_bias, codebook_dim, latent_dim,
                          3, time_steps, 1, 1);
     free(hidden);
+    stage_preconv_ms = now_ms() - stage_t0;
 
     /* 3. Transpose to [time_steps, latent_dim] for transformer */
     float *hidden_seq = (float *)malloc((size_t)time_steps * latent_dim * sizeof(float));
@@ -495,7 +521,9 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     free(pre_conv_out);
 
     /* 4. Transformer forward pass */
+    stage_t0 = now_ms();
     codec_transformer_forward(ctx, hidden_seq, time_steps);
+    stage_transformer_ms = now_ms() - stage_t0;
 
     /* 5. Transpose back to [latent_dim, time_steps] */
     hidden = (float *)malloc((size_t)latent_dim * time_steps * sizeof(float));
@@ -505,6 +533,7 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
     free(hidden_seq);
 
     /* 6. Upsample stages (2× TransConv + ConvNeXt) */
+    stage_t0 = now_ms();
     int current_len = time_steps;
     for (int stage = 0; stage < 2; stage++) {
         int factor = cfg->codec_upsampling_ratios[stage];
@@ -522,8 +551,10 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         /* ConvNeXt block */
         codec_convnext_forward(&ctx->codec.upsample_convnext[stage], hidden, latent_dim, &current_len);
     }
+    stage_upsample_ms = now_ms() - stage_t0;
 
     /* 7. Vocoder */
+    stage_t0 = now_ms();
 
     /* 7a. Initial conv: CausalConv1d(latent_dim, decoder_dim, k=7) */
     int decoder_dim = cfg->codec_decoder_dim;
@@ -587,12 +618,17 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
 
     /* 8. Clamp to [-1, 1] */
     kernel_clamp(wav, current_len, -1.0f, 1.0f);
+    stage_vocoder_ms = now_ms() - stage_t0;
 
     *out_samples = current_len;
 
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Codec decode complete: %d samples (%.2f seconds)\n",
                 current_len, (float)current_len / QWEN_TTS_SAMPLE_RATE);
+    if (qwen_tts_verbose >= 2) {
+        fprintf(stderr, "Codec stages (ms): rvq=%.1f preconv=%.1f transformer=%.1f upsample=%.1f vocoder=%.1f\n",
+                stage_rvq_ms, stage_preconv_ms, stage_transformer_ms, stage_upsample_ms, stage_vocoder_ms);
+    }
 
     return wav;
 }

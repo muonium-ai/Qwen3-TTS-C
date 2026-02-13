@@ -237,6 +237,7 @@ typedef struct {
 typedef struct {
     float *cluster_usage;     /* [codebook_size] */
     float *embedding_sum;     /* [codebook_size, codebook_dim] */
+    float *embeddings;        /* [codebook_size, codebook_dim] = embedding_sum / cluster_usage */
     float *project_out_weight;/* [dim, codebook_dim] or NULL if same dim */
     float *project_out_bias;  /* [dim] or NULL */
 } qwen_tts_codebook_t;
@@ -399,6 +400,17 @@ typedef struct {
     float *tk_pref_attn_out, *tk_pref_proj_out;
     float *tk_pref_gate, *tk_pref_gate_up, *tk_pref_ffn_out;
     int tk_pref_cap;
+
+    /* Persistent sub-talker scratch buffers */
+    float *st_x, *st_x_norm, *st_q, *st_k, *st_v;
+    float *st_attn_out, *st_logits;
+    float *st_gate, *st_up;
+    float *st_embed, *st_proj_hidden;
+    float *st_scores;              /* attention scores [subtalker_kv_max] */
+    float *st_rope_cos, *st_rope_sin;
+    int st_embed_cap;              /* dims for st_embed */
+    int st_scores_cap;             /* entries for st_scores */
+    int st_rope_cap;               /* positions for st_rope_* */
 
     /* RoPE caches */
     float *talker_rope_cos_cache;   /* [max_pos, head_dim*3] for M-RoPE */

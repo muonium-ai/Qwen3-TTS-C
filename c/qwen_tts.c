@@ -481,6 +481,25 @@ static void load_subtalker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_
  * Load Codec Decoder (Speech Tokenizer) Weights
  * ======================================================================== */
 
+static void build_codec_codebook_embeddings(qwen_tts_codebook_t *cb, int codebook_size, int codebook_dim) {
+    if (!cb || !cb->cluster_usage || !cb->embedding_sum) return;
+
+    size_t total = (size_t)codebook_size * codebook_dim;
+    cb->embeddings = (float *)malloc(total * sizeof(float));
+    if (!cb->embeddings) return;
+
+    for (int c = 0; c < codebook_size; c++) {
+        float usage = cb->cluster_usage[c];
+        if (usage < 1e-5f) usage = 1e-5f;
+        float inv_usage = 1.0f / usage;
+        float *dst = cb->embeddings + (size_t)c * codebook_dim;
+        const float *src = cb->embedding_sum + (size_t)c * codebook_dim;
+        for (int d = 0; d < codebook_dim; d++) {
+            dst[d] = src[d] * inv_usage;
+        }
+    }
+}
+
 static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *ms) {
     qwen_tts_config_t *cfg = &ctx->config;
     qwen_tts_codec_decoder_t *codec = &ctx->codec;
@@ -495,6 +514,8 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
                    "decoder.quantizer.rvq_first.vq.layers.0._codebook.cluster_usage");
     LOAD_F32_CHECK(codec->rvq.semantic_codebooks[0].embedding_sum, ms,
                    "decoder.quantizer.rvq_first.vq.layers.0._codebook.embedding_sum");
+    build_codec_codebook_embeddings(&codec->rvq.semantic_codebooks[0],
+                                    cfg->codec_codebook_size, cfg->codec_codebook_dim / 2);
 
     /* Semantic output_proj: Conv1d(vq_dim, codebook_dim, 1) */
     LOAD_F32_CHECK(codec->rvq.semantic_output_proj, ms,
@@ -506,6 +527,8 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         LOAD_F32_CHECK(codec->rvq.acoustic_codebooks[q].cluster_usage, ms, name);
         snprintf(name, sizeof(name), "decoder.quantizer.rvq_rest.vq.layers.%d._codebook.embedding_sum", q);
         LOAD_F32_CHECK(codec->rvq.acoustic_codebooks[q].embedding_sum, ms, name);
+        build_codec_codebook_embeddings(&codec->rvq.acoustic_codebooks[q],
+                                        cfg->codec_codebook_size, cfg->codec_codebook_dim / 2);
     }
 
     LOAD_F32_CHECK(codec->rvq.acoustic_output_proj, ms,
@@ -757,10 +780,12 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     for (int i = 0; i < 1; i++) {
         free(ctx->codec.rvq.semantic_codebooks[i].cluster_usage);
         free(ctx->codec.rvq.semantic_codebooks[i].embedding_sum);
+        free(ctx->codec.rvq.semantic_codebooks[i].embeddings);
     }
     for (int i = 0; i < ctx->config.codec_num_quantizers - 1; i++) {
         free(ctx->codec.rvq.acoustic_codebooks[i].cluster_usage);
         free(ctx->codec.rvq.acoustic_codebooks[i].embedding_sum);
+        free(ctx->codec.rvq.acoustic_codebooks[i].embeddings);
     }
     free(ctx->codec.rvq.semantic_output_proj);
     free(ctx->codec.rvq.acoustic_output_proj);
@@ -840,6 +865,13 @@ void qwen_tts_free(qwen_tts_ctx_t *ctx) {
     free(ctx->tk_pref_q); free(ctx->tk_pref_k); free(ctx->tk_pref_v);
     free(ctx->tk_pref_attn_out); free(ctx->tk_pref_proj_out);
     free(ctx->tk_pref_gate); free(ctx->tk_pref_gate_up); free(ctx->tk_pref_ffn_out);
+    free(ctx->st_x); free(ctx->st_x_norm);
+    free(ctx->st_q); free(ctx->st_k); free(ctx->st_v);
+    free(ctx->st_attn_out); free(ctx->st_logits);
+    free(ctx->st_gate); free(ctx->st_up);
+    free(ctx->st_embed); free(ctx->st_proj_hidden);
+    free(ctx->st_scores);
+    free(ctx->st_rope_cos); free(ctx->st_rope_sin);
     free(ctx->talker_rope_cos_cache); free(ctx->talker_rope_sin_cache);
 
     /* Free config maps */

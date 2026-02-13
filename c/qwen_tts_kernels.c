@@ -618,6 +618,29 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
             return;
         }
 
+#ifdef USE_BLAS
+        if (groups == 1) {
+            /*
+             * Pointwise conv with groups=1 is matrix multiply:
+             *   out[out_channels, length] = weight[out_channels, in_channels] * input[in_channels, length]
+             */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        out_channels, length, in_channels,
+                        1.0f, weight, in_channels,
+                        input, length,
+                        0.0f, out, length);
+
+            if (bias) {
+                for (int oc = 0; oc < out_channels; oc++) {
+                    float b = bias[oc];
+                    float *out_ch = out + (size_t)oc * length;
+                    for (int t = 0; t < length; t++) out_ch[t] += b;
+                }
+            }
+            return;
+        }
+#endif
+
         for (int oc = 0; oc < out_channels; oc++) {
             int g = oc / out_per_group;
             const float *w_row = weight + (size_t)oc * ch_per_group;
@@ -641,18 +664,29 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
         for (int oc = 0; oc < out_channels; oc++) {
             int g = oc / out_per_group;
             int ic_base = g * ch_per_group;
-            for (int t = 0; t < length; t++) {
-                float sum = bias ? bias[oc] : 0.0f;
-                int k_start = (pad > t) ? (pad - t) : 0;
-                int in_t0 = t - pad + k_start;
-                for (int ic = 0; ic < ch_per_group; ic++) {
-                    const float *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
-                    const float *in = input + (size_t)(ic_base + ic) * length + in_t0;
-                    for (int k = k_start; k < kernel_size; k++) {
-                        sum += w[k] * (*in++);
+            float *out_ch = out + (size_t)oc * length;
+            float b = bias ? bias[oc] : 0.0f;
+            for (int t = 0; t < length; t++) out_ch[t] = b;
+
+            for (int ic = 0; ic < ch_per_group; ic++) {
+                const float *w = weight + ((size_t)oc * ch_per_group + ic) * kernel_size;
+                const float *in_ch = input + (size_t)(ic_base + ic) * length;
+
+                for (int k = 0; k < kernel_size; k++) {
+                    float wk = w[k];
+                    int out_start = pad - k;
+                    if (out_start >= length) continue;
+                    const float *src = in_ch;
+                    float *dst = out_ch + out_start;
+                    int n = length - out_start;
+#ifdef USE_BLAS
+                    cblas_saxpy(n, wk, src, 1, dst, 1);
+#else
+                    for (int i = 0; i < n; i++) {
+                        dst[i] += wk * src[i];
                     }
+#endif
                 }
-                out[oc * length + t] = sum;
             }
         }
         return;
@@ -706,6 +740,14 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
         for (int ic = 0; ic < in_channels; ic++) {
             const float *in_ch = input + (size_t)ic * length;
             const float *w = weight + (size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size;
+#ifdef USE_BLAS
+            for (int k = 0; k < kernel_size; k++) {
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+                cblas_saxpy(n, w[k], in_ch, 1, out_ch + k, stride);
+            }
+#else
             for (int t = 0; t < length; t++) {
                 float val = in_ch[t];
                 int base = t * stride;
@@ -714,6 +756,7 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
                     if (ot < final_len) out_ch[ot] += val * w[k];
                 }
             }
+#endif
         }
     }
 

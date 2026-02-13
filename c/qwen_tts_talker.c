@@ -526,26 +526,24 @@ void qwen_tts_subtalker_generate(
     }
     ctx->subtalker_kv_len = 0;
 
-    /* Scratch buffers */
-    float *x = (float *)malloc(st_hidden * sizeof(float));
-    float *x_norm = (float *)malloc(st_hidden * sizeof(float));
-    float *q_buf = (float *)malloc(st_heads * st_head_dim * sizeof(float));
-    float *k_buf = (float *)malloc(st_kv_dim * sizeof(float));
-    float *v_buf = (float *)malloc(st_kv_dim * sizeof(float));
-    float *attn_out = (float *)malloc(st_heads * st_head_dim * sizeof(float));
-    float *logits_buf = (float *)malloc(st_vocab * sizeof(float));
-    float *st_gate_buf = (float *)malloc(st_intermediate * sizeof(float));
-    float *st_up_buf = (float *)malloc(st_intermediate * sizeof(float));
-
-    /* Sub-talker prefill: first input is projected talker hidden state */
-    /* small_to_mtp_projection: talker_hidden -> subtalker_hidden */
-    if (ctx->subtalker.input_proj_bf16) {
-        kernel_matvec_bf16(x, ctx->subtalker.input_proj_bf16, talker_hidden, st_hidden, talker_hidden_dim);
-        if (ctx->subtalker.input_proj_bias) {
-            kernel_add_inplace(x, ctx->subtalker.input_proj_bias, st_hidden);
-        }
-    } else {
-        memcpy(x, talker_hidden, st_hidden * sizeof(float));
+    /* Persistent scratch buffers */
+    if (!ctx->st_x) ctx->st_x = (float *)malloc(st_hidden * sizeof(float));
+    if (!ctx->st_x_norm) ctx->st_x_norm = (float *)malloc(st_hidden * sizeof(float));
+    if (!ctx->st_q) ctx->st_q = (float *)malloc(st_heads * st_head_dim * sizeof(float));
+    if (!ctx->st_k) ctx->st_k = (float *)malloc(st_kv_dim * sizeof(float));
+    if (!ctx->st_v) ctx->st_v = (float *)malloc(st_kv_dim * sizeof(float));
+    if (!ctx->st_attn_out) ctx->st_attn_out = (float *)malloc(st_heads * st_head_dim * sizeof(float));
+    if (!ctx->st_logits) ctx->st_logits = (float *)malloc(st_vocab * sizeof(float));
+    if (!ctx->st_gate) ctx->st_gate = (float *)malloc(st_intermediate * sizeof(float));
+    if (!ctx->st_up) ctx->st_up = (float *)malloc(st_intermediate * sizeof(float));
+    if (!ctx->st_proj_hidden) ctx->st_proj_hidden = (float *)malloc(st_hidden * sizeof(float));
+    if (!ctx->st_embed || ctx->st_embed_cap < talker_hidden_dim) {
+        ctx->st_embed = (float *)realloc(ctx->st_embed, talker_hidden_dim * sizeof(float));
+        ctx->st_embed_cap = talker_hidden_dim;
+    }
+    if (!ctx->st_scores || ctx->st_scores_cap < max_seq) {
+        ctx->st_scores = (float *)realloc(ctx->st_scores, max_seq * sizeof(float));
+        ctx->st_scores_cap = max_seq;
     }
 
     /* Process: prefill with [talker_hidden_proj, embed(first_code)]
@@ -571,17 +569,34 @@ void qwen_tts_subtalker_generate(
      * Step k: input = subtalker_embed[k-2](group_{k-1}_code), pos k → logits from lm_head[k-1] → group k
      */
 
-    /* Compute RoPE cache for sub-talker (standard RoPE, not M-RoPE) */
-    float *rope_cos = (float *)malloc(max_seq * st_head_dim * sizeof(float));
-    float *rope_sin = (float *)malloc(max_seq * st_head_dim * sizeof(float));
-    compute_rope_cache(rope_cos, rope_sin, max_seq, st_head_dim, cfg->talker_rope_theta);
+    /* Compute RoPE cache once and reuse across calls */
+    if (!ctx->st_rope_cos || !ctx->st_rope_sin || ctx->st_rope_cap < max_seq) {
+        size_t rope_bytes = (size_t)max_seq * st_head_dim * sizeof(float);
+        ctx->st_rope_cos = (float *)realloc(ctx->st_rope_cos, rope_bytes);
+        ctx->st_rope_sin = (float *)realloc(ctx->st_rope_sin, rope_bytes);
+        compute_rope_cache(ctx->st_rope_cos, ctx->st_rope_sin, max_seq, st_head_dim, cfg->talker_rope_theta);
+        ctx->st_rope_cap = max_seq;
+    }
+
+    float *x = ctx->st_x;
+    float *x_norm = ctx->st_x_norm;
+    float *q_buf = ctx->st_q;
+    float *k_buf = ctx->st_k;
+    float *v_buf = ctx->st_v;
+    float *attn_out = ctx->st_attn_out;
+    float *logits_buf = ctx->st_logits;
+    float *st_gate_buf = ctx->st_gate;
+    float *st_up_buf = ctx->st_up;
+    float *embed_buf = ctx->st_embed;
+    float *proj_hidden = ctx->st_proj_hidden;
+    size_t kv_stride = (size_t)ctx->subtalker_kv_max * st_kv_dim;
+    float attn_scale = 1.0f / sqrtf((float)st_head_dim);
 
     /* Forward function for one sub-talker token */
     #define ST_FORWARD(input_vec, pos_idx) do { \
         memcpy(x, input_vec, st_hidden * sizeof(float)); \
         for (int sl = 0; sl < st_layers; sl++) { \
             qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[sl]; \
-            size_t kv_stride = (size_t)ctx->subtalker_kv_max * st_kv_dim; \
             kernel_rms_norm(x_norm, x, l->input_norm, st_hidden, eps); \
             kernel_matvec_bf16(q_buf, l->wq_bf16, x_norm, st_heads * st_head_dim, st_hidden); \
             kernel_matvec_bf16(k_buf, l->wk_bf16, x_norm, st_kv_dim, st_hidden); \
@@ -590,25 +605,24 @@ void qwen_tts_subtalker_generate(
                 kernel_rms_norm_inplace(q_buf + h * st_head_dim, l->q_norm_weight, st_head_dim, eps); \
             for (int h = 0; h < st_kv_heads; h++) \
                 kernel_rms_norm_inplace(k_buf + h * st_head_dim, l->k_norm_weight, st_head_dim, eps); \
-            kernel_rope_apply(q_buf, NULL, rope_cos + (pos_idx) * st_head_dim, \
-                              rope_sin + (pos_idx) * st_head_dim, st_heads, st_head_dim); \
-            kernel_rope_apply(k_buf, NULL, rope_cos + (pos_idx) * st_head_dim, \
-                              rope_sin + (pos_idx) * st_head_dim, st_kv_heads, st_head_dim); \
+            kernel_rope_apply(q_buf, NULL, ctx->st_rope_cos + (pos_idx) * st_head_dim, \
+                              ctx->st_rope_sin + (pos_idx) * st_head_dim, st_heads, st_head_dim); \
+            kernel_rope_apply(k_buf, NULL, ctx->st_rope_cos + (pos_idx) * st_head_dim, \
+                              ctx->st_rope_sin + (pos_idx) * st_head_dim, st_kv_heads, st_head_dim); \
             memcpy(ctx->subtalker_kv_k + sl * kv_stride + (pos_idx) * st_kv_dim, k_buf, st_kv_dim * sizeof(float)); \
             memcpy(ctx->subtalker_kv_v + sl * kv_stride + (pos_idx) * st_kv_dim, v_buf, st_kv_dim * sizeof(float)); \
-            float _scale = 1.0f / sqrtf((float)st_head_dim); \
             for (int h = 0; h < st_heads; h++) { \
                 int kvh = h / groups_per_head; \
                 float *_q = q_buf + h * st_head_dim; \
                 float *_o = attn_out + h * st_head_dim; \
+                float *_scores = ctx->st_scores; \
                 memset(_o, 0, st_head_dim * sizeof(float)); \
                 float _max = -1e30f; \
-                float _scores[64]; \
                 for (int t = 0; t <= (pos_idx); t++) { \
                     float *_k = ctx->subtalker_kv_k + sl * kv_stride + t * st_kv_dim + kvh * st_head_dim; \
                     float sc = 0; \
                     for (int d = 0; d < st_head_dim; d++) sc += _q[d] * _k[d]; \
-                    sc *= _scale; _scores[t] = sc; if (sc > _max) _max = sc; \
+                    sc *= attn_scale; _scores[t] = sc; if (sc > _max) _max = sc; \
                 } \
                 float _sum = 0; \
                 for (int t = 0; t <= (pos_idx); t++) { _scores[t] = expf(_scores[t] - _max); _sum += _scores[t]; } \
@@ -631,40 +645,32 @@ void qwen_tts_subtalker_generate(
             kernel_matvec_bf16(x_norm, l->down_bf16, _gate, st_hidden, st_intermediate); \
             kernel_add_inplace(x, x_norm, st_hidden); \
         } \
+        ctx->subtalker_kv_len = (pos_idx) + 1; \
         kernel_rms_norm_inplace(x, ctx->subtalker.norm, st_hidden, eps); \
     } while(0)
 
-    /* Step 0: Process projected talker hidden (no logits generated) */
-    float *proj_hidden = (float *)malloc(st_hidden * sizeof(float));
-    if (ctx->subtalker.input_proj_bf16) {
-        kernel_matvec_bf16(proj_hidden, ctx->subtalker.input_proj_bf16, talker_hidden, st_hidden, talker_hidden_dim);
-        if (ctx->subtalker.input_proj_bias)
-            kernel_add_inplace(proj_hidden, ctx->subtalker.input_proj_bias, st_hidden);
-    } else {
-        memcpy(proj_hidden, talker_hidden, st_hidden * sizeof(float));
-    }
-    ST_FORWARD(proj_hidden, 0);
-    free(proj_hidden);
+    #define ST_PROJECT_INPUT(dst, src, src_dim) do { \
+        if (ctx->subtalker.input_proj_bf16) { \
+            kernel_matvec_bf16(dst, ctx->subtalker.input_proj_bf16, src, st_hidden, src_dim); \
+            if (ctx->subtalker.input_proj_bias) kernel_add_inplace(dst, ctx->subtalker.input_proj_bias, st_hidden); \
+        } else { \
+            int copy_dim = (src_dim) < st_hidden ? (src_dim) : st_hidden; \
+            memcpy(dst, src, copy_dim * sizeof(float)); \
+            if (copy_dim < st_hidden) memset(dst + copy_dim, 0, (st_hidden - copy_dim) * sizeof(float)); \
+        } \
+    } while(0)
 
-    /* Step 1: Process first_code embedding → generate group 1 */
-    int embed_dim = talker_hidden_dim > st_hidden ? talker_hidden_dim : st_hidden;
-    float *embed_buf = (float *)malloc(embed_dim * sizeof(float));
+    /* Step 0: Process projected talker hidden (no logits generated) */
+    ST_PROJECT_INPUT(proj_hidden, talker_hidden, talker_hidden_dim);
+    ST_FORWARD(proj_hidden, 0);
 
     /* Get embedding for first_code from talker's codec_embedding (group 0 uses talker embedding) */
     {
         const uint16_t *emb = ctx->talker.codec_embedding_bf16;
         kernel_bf16_to_f32(embed_buf, emb + first_code * talker_hidden_dim, talker_hidden_dim);
-        /* Project to sub-talker dim if different */
-        if (talker_hidden_dim != st_hidden && ctx->subtalker.input_proj_bf16) {
-            float *tmp = (float *)malloc(st_hidden * sizeof(float));
-            kernel_matvec_bf16(tmp, ctx->subtalker.input_proj_bf16, embed_buf, st_hidden, talker_hidden_dim);
-            if (ctx->subtalker.input_proj_bias)
-                kernel_add_inplace(tmp, ctx->subtalker.input_proj_bias, st_hidden);
-            memcpy(embed_buf, tmp, st_hidden * sizeof(float));
-            free(tmp);
-        }
     }
-    ST_FORWARD(embed_buf, 1);
+    ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
+    ST_FORWARD(proj_hidden, 1);
 
     /* Generate group 1 from lm_head[0] */
     kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[0], x, st_vocab, st_hidden);
@@ -677,24 +683,13 @@ void qwen_tts_subtalker_generate(
         /* Embed the previous group's code using sub-talker embedding */
         kernel_bf16_to_f32(embed_buf, ctx->subtalker.codec_embeddings_bf16[g - 2] +
                            (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
-        if (talker_hidden_dim != st_hidden && ctx->subtalker.input_proj_bf16) {
-            float *tmp = (float *)malloc(st_hidden * sizeof(float));
-            kernel_matvec_bf16(tmp, ctx->subtalker.input_proj_bf16, embed_buf, st_hidden, talker_hidden_dim);
-            if (ctx->subtalker.input_proj_bias)
-                kernel_add_inplace(tmp, ctx->subtalker.input_proj_bias, st_hidden);
-            memcpy(embed_buf, tmp, st_hidden * sizeof(float));
-            free(tmp);
-        }
-        ST_FORWARD(embed_buf, g);
+        ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
+        ST_FORWARD(proj_hidden, g);
         kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[g - 1], x, st_vocab, st_hidden);
         out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                             ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
     }
 
+    #undef ST_PROJECT_INPUT
     #undef ST_FORWARD
-
-    free(x); free(x_norm); free(q_buf); free(k_buf); free(v_buf);
-    free(attn_out); free(logits_buf); free(embed_buf);
-    free(st_gate_buf); free(st_up_buf);
-    free(rope_cos); free(rope_sin);
 }
