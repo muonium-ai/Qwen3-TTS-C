@@ -226,6 +226,13 @@ typedef struct {
     uint16_t *up_bf16;
     uint16_t *down_bf16;
     uint16_t *gate_up_fused_bf16;
+#ifdef USE_METAL
+    int mtl_wq, mtl_wk, mtl_wv, mtl_wo;
+    int mtl_q_norm, mtl_k_norm;
+    int mtl_input_norm, mtl_post_attn_norm;
+    int mtl_gate, mtl_up, mtl_down;
+    int mtl_gate_up_fused;
+#endif
 } qwen_tts_subtalker_layer_t;
 
 typedef struct {
@@ -244,6 +251,12 @@ typedef struct {
 
     /* 31 LM heads (one per code group 1-31) */
     uint16_t *lm_heads_bf16[QWEN_TTS_NUM_CODE_GROUPS - 1];  /* each [subtalker_vocab, subtalker_hidden] */
+#ifdef USE_METAL
+    int mtl_codec_embeddings[QWEN_TTS_NUM_CODE_GROUPS - 1];
+    int mtl_input_proj, mtl_input_proj_bias;
+    int mtl_norm;
+    int mtl_lm_heads[QWEN_TTS_NUM_CODE_GROUPS - 1];
+#endif
 } qwen_tts_subtalker_t;
 
 /* ========================================================================
@@ -475,6 +488,9 @@ typedef struct {
     int mtl_scores;
     int mtl_kv_k, mtl_kv_v;     /* KV cache as Metal buffers */
     int mtl_kv_max;              /* current Metal KV buffer capacity */
+    int mtl_sub_scores;
+    int mtl_sub_kv_k, mtl_sub_kv_v;
+    int mtl_sub_kv_max;
 #endif
 } qwen_tts_ctx_t;
 

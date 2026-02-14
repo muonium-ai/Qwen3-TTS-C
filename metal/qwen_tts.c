@@ -939,6 +939,10 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     ctx->mtl_kv_k = METAL_BUF_INVALID;
     ctx->mtl_kv_v = METAL_BUF_INVALID;
     ctx->mtl_kv_max = 0;
+    ctx->mtl_sub_scores = METAL_BUF_INVALID;
+    ctx->mtl_sub_kv_k = METAL_BUF_INVALID;
+    ctx->mtl_sub_kv_v = METAL_BUF_INVALID;
+    ctx->mtl_sub_kv_max = 0;
 #endif
 
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
@@ -958,6 +962,32 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         free(ctx);
         return NULL;
     }
+
+#ifdef USE_METAL
+    /* Initialize optional Metal weight handles to invalid for robust fallback checks. */
+    ctx->subtalker.mtl_input_proj = METAL_BUF_INVALID;
+    ctx->subtalker.mtl_input_proj_bias = METAL_BUF_INVALID;
+    ctx->subtalker.mtl_norm = METAL_BUF_INVALID;
+    for (int g = 0; g < QWEN_TTS_NUM_CODE_GROUPS - 1; g++) {
+        ctx->subtalker.mtl_codec_embeddings[g] = METAL_BUF_INVALID;
+        ctx->subtalker.mtl_lm_heads[g] = METAL_BUF_INVALID;
+    }
+    for (int i = 0; i < ctx->config.subtalker_layers; i++) {
+        qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[i];
+        l->mtl_wq = METAL_BUF_INVALID;
+        l->mtl_wk = METAL_BUF_INVALID;
+        l->mtl_wv = METAL_BUF_INVALID;
+        l->mtl_wo = METAL_BUF_INVALID;
+        l->mtl_q_norm = METAL_BUF_INVALID;
+        l->mtl_k_norm = METAL_BUF_INVALID;
+        l->mtl_input_norm = METAL_BUF_INVALID;
+        l->mtl_post_attn_norm = METAL_BUF_INVALID;
+        l->mtl_gate = METAL_BUF_INVALID;
+        l->mtl_up = METAL_BUF_INVALID;
+        l->mtl_down = METAL_BUF_INVALID;
+        l->mtl_gate_up_fused = METAL_BUF_INVALID;
+    }
+#endif
 
     /* Open talker safetensors */
     multi_safetensors_t *ms = multi_safetensors_open(model_dir);
@@ -998,6 +1028,11 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         int intermediate = mcfg->talker_intermediate;
         int num_heads = mcfg->talker_heads;
         int head_dim = mcfg->talker_head_dim;
+        int st_hidden = mcfg->subtalker_hidden;
+        int st_kv_dim = mcfg->subtalker_kv_heads * mcfg->subtalker_head_dim;
+        int st_intermediate = mcfg->subtalker_intermediate;
+        int st_heads = mcfg->subtalker_heads;
+        int st_head_dim = mcfg->subtalker_head_dim;
 
         /* Talker embeddings and projections */
         if (ctx->talker.codec_embedding_bf16)
@@ -1043,6 +1078,61 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
             if (l->gate_up_fused_bf16) l->mtl_gate_up_fused = metal_buf_from_ptr(
                 l->gate_up_fused_bf16,
                 (size_t)2 * intermediate * hidden * sizeof(uint16_t));
+        }
+
+        /* Sub-talker embeddings, projections, and heads */
+        for (int g = 0; g < QWEN_TTS_NUM_CODE_GROUPS - 1; g++) {
+            if (ctx->subtalker.codec_embeddings_bf16[g]) {
+                ctx->subtalker.mtl_codec_embeddings[g] = metal_buf_from_ptr(
+                    ctx->subtalker.codec_embeddings_bf16[g],
+                    (size_t)mcfg->subtalker_vocab_size * hidden * sizeof(uint16_t));
+            }
+            if (ctx->subtalker.lm_heads_bf16[g]) {
+                ctx->subtalker.mtl_lm_heads[g] = metal_buf_from_ptr(
+                    ctx->subtalker.lm_heads_bf16[g],
+                    (size_t)mcfg->subtalker_vocab_size * st_hidden * sizeof(uint16_t));
+            }
+        }
+        if (ctx->subtalker.input_proj_bf16) {
+            ctx->subtalker.mtl_input_proj = metal_buf_from_ptr(
+                ctx->subtalker.input_proj_bf16,
+                (size_t)st_hidden * hidden * sizeof(uint16_t));
+        }
+        if (ctx->subtalker.input_proj_bias) {
+            ctx->subtalker.mtl_input_proj_bias = metal_buf_create(
+                ctx->subtalker.input_proj_bias, st_hidden * sizeof(float));
+        }
+        if (ctx->subtalker.norm) {
+            ctx->subtalker.mtl_norm = metal_buf_create(ctx->subtalker.norm, st_hidden * sizeof(float));
+        }
+
+        for (int i = 0; i < mcfg->subtalker_layers; i++) {
+            qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[i];
+            if (l->wq_bf16) l->mtl_wq = metal_buf_from_ptr(l->wq_bf16,
+                (size_t)st_heads * st_head_dim * st_hidden * sizeof(uint16_t));
+            if (l->wk_bf16) l->mtl_wk = metal_buf_from_ptr(l->wk_bf16,
+                (size_t)st_kv_dim * st_hidden * sizeof(uint16_t));
+            if (l->wv_bf16) l->mtl_wv = metal_buf_from_ptr(l->wv_bf16,
+                (size_t)st_kv_dim * st_hidden * sizeof(uint16_t));
+            if (l->wo_bf16) l->mtl_wo = metal_buf_from_ptr(l->wo_bf16,
+                (size_t)st_hidden * st_heads * st_head_dim * sizeof(uint16_t));
+            if (l->q_norm_weight) l->mtl_q_norm = metal_buf_create(l->q_norm_weight,
+                st_head_dim * sizeof(float));
+            if (l->k_norm_weight) l->mtl_k_norm = metal_buf_create(l->k_norm_weight,
+                st_head_dim * sizeof(float));
+            if (l->input_norm) l->mtl_input_norm = metal_buf_create(l->input_norm,
+                st_hidden * sizeof(float));
+            if (l->post_attn_norm) l->mtl_post_attn_norm = metal_buf_create(l->post_attn_norm,
+                st_hidden * sizeof(float));
+            if (l->gate_bf16) l->mtl_gate = metal_buf_from_ptr(l->gate_bf16,
+                (size_t)st_intermediate * st_hidden * sizeof(uint16_t));
+            if (l->up_bf16) l->mtl_up = metal_buf_from_ptr(l->up_bf16,
+                (size_t)st_intermediate * st_hidden * sizeof(uint16_t));
+            if (l->down_bf16) l->mtl_down = metal_buf_from_ptr(l->down_bf16,
+                (size_t)st_hidden * st_intermediate * sizeof(uint16_t));
+            if (l->gate_up_fused_bf16) l->mtl_gate_up_fused = metal_buf_from_ptr(
+                l->gate_up_fused_bf16,
+                (size_t)2 * st_intermediate * st_hidden * sizeof(uint16_t));
         }
 
         if (qwen_tts_verbose >= 1)
