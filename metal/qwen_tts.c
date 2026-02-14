@@ -922,6 +922,24 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     qwen_tts_ctx_t *ctx = (qwen_tts_ctx_t *)calloc(1, sizeof(qwen_tts_ctx_t));
     if (!ctx) return NULL;
 
+#ifdef USE_METAL
+    /* Mark runtime Metal scratch/cache buffer IDs as invalid. */
+    ctx->mtl_x = METAL_BUF_INVALID;
+    ctx->mtl_x_norm = METAL_BUF_INVALID;
+    ctx->mtl_q = METAL_BUF_INVALID;
+    ctx->mtl_k = METAL_BUF_INVALID;
+    ctx->mtl_v = METAL_BUF_INVALID;
+    ctx->mtl_attn_out = METAL_BUF_INVALID;
+    ctx->mtl_gate = METAL_BUF_INVALID;
+    ctx->mtl_up = METAL_BUF_INVALID;
+    ctx->mtl_rope_cos = METAL_BUF_INVALID;
+    ctx->mtl_rope_sin = METAL_BUF_INVALID;
+    ctx->mtl_scores = METAL_BUF_INVALID;
+    ctx->mtl_kv_k = METAL_BUF_INVALID;
+    ctx->mtl_kv_v = METAL_BUF_INVALID;
+    ctx->mtl_kv_max = 0;
+#endif
+
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
 
     /* Set default generation parameters */
@@ -955,6 +973,9 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     }
     load_subtalker_weights(ctx, ms);
 
+    /* Initialize compute backends before optional GPU weight upload paths. */
+    kernel_init();
+
     /* Open codec decoder safetensors */
 #ifndef __EMSCRIPTEN__
     if (ensure_codec_loaded(ctx) != 0) {
@@ -965,8 +986,6 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
         fprintf(stderr, "WASM: deferring codec decoder load until decode stage\n");
     }
 #endif
-
-    kernel_init();
 
 #ifdef USE_METAL
     /* Upload weights to Metal GPU buffers */

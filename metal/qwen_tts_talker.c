@@ -19,6 +19,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 extern int qwen_tts_verbose;
 
@@ -112,13 +113,30 @@ static void compute_mrope_pos(float *cos_out, float *sin_out,
     }
 }
 
+static double talker_now_ms(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static int should_trace_layers(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("QWEN_TTS_LAYER_TRACE");
+        enabled = (env && atoi(env) != 0) ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+
 /* ========================================================================
  * Talker attention - single token (Metal GPU path)
  * ======================================================================== */
 
 #ifdef USE_METAL
 
-static void ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
+static int ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *cfg = &ctx->config;
     int hidden = cfg->talker_hidden;
     int num_heads = cfg->talker_heads;
@@ -127,18 +145,78 @@ static void ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
     int kv_dim = kv_heads * head_dim;
     int intermediate = cfg->talker_intermediate;
 
-    static int scratch_init = 0;
-    if (scratch_init) return;
-    scratch_init = 1;
+    ctx->mtl_x = metal_buf_ensure(ctx->mtl_x, hidden * sizeof(float));
+    ctx->mtl_x_norm = metal_buf_ensure(ctx->mtl_x_norm, hidden * sizeof(float));
+    ctx->mtl_q = metal_buf_ensure(ctx->mtl_q, num_heads * head_dim * sizeof(float));
+    ctx->mtl_k = metal_buf_ensure(ctx->mtl_k, kv_dim * sizeof(float));
+    ctx->mtl_v = metal_buf_ensure(ctx->mtl_v, kv_dim * sizeof(float));
+    ctx->mtl_attn_out = metal_buf_ensure(ctx->mtl_attn_out, num_heads * head_dim * sizeof(float));
+    ctx->mtl_gate = metal_buf_ensure(ctx->mtl_gate, intermediate * sizeof(float));
+    ctx->mtl_up = metal_buf_ensure(ctx->mtl_up, intermediate * sizeof(float));
+    ctx->mtl_rope_cos = metal_buf_ensure(ctx->mtl_rope_cos, head_dim * sizeof(float));
+    ctx->mtl_rope_sin = metal_buf_ensure(ctx->mtl_rope_sin, head_dim * sizeof(float));
 
-    ctx->mtl_x = metal_buf_create_empty(hidden * sizeof(float));
-    ctx->mtl_x_norm = metal_buf_create_empty(hidden * sizeof(float));
-    ctx->mtl_q = metal_buf_create_empty(num_heads * head_dim * sizeof(float));
-    ctx->mtl_k = metal_buf_create_empty(kv_dim * sizeof(float));
-    ctx->mtl_v = metal_buf_create_empty(kv_dim * sizeof(float));
-    ctx->mtl_attn_out = metal_buf_create_empty(num_heads * head_dim * sizeof(float));
-    ctx->mtl_gate = metal_buf_create_empty(intermediate * sizeof(float));
-    ctx->mtl_up = metal_buf_create_empty(intermediate * sizeof(float));
+    if (ctx->mtl_x == METAL_BUF_INVALID || ctx->mtl_x_norm == METAL_BUF_INVALID ||
+        ctx->mtl_q == METAL_BUF_INVALID || ctx->mtl_k == METAL_BUF_INVALID ||
+        ctx->mtl_v == METAL_BUF_INVALID || ctx->mtl_attn_out == METAL_BUF_INVALID ||
+        ctx->mtl_gate == METAL_BUF_INVALID || ctx->mtl_up == METAL_BUF_INVALID ||
+        ctx->mtl_rope_cos == METAL_BUF_INVALID || ctx->mtl_rope_sin == METAL_BUF_INVALID) {
+        return -1;
+    }
+    return 0;
+}
+
+static int ensure_talker_metal_kv_cache(qwen_tts_ctx_t *ctx, int prefill_len) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int kv_dim = cfg->talker_kv_heads * cfg->talker_head_dim;
+    int num_heads = cfg->talker_heads;
+    int layers = cfg->talker_layers;
+    int needed_max = ctx->talker_kv_max;
+
+    if (!ctx->talker_kv_k || !ctx->talker_kv_v || needed_max <= 0) return -1;
+
+    size_t kv_elems = (size_t)layers * needed_max * kv_dim;
+    size_t scores_elems = (size_t)num_heads * needed_max;
+    if (ctx->mtl_kv_k == METAL_BUF_INVALID || ctx->mtl_kv_v == METAL_BUF_INVALID ||
+        ctx->mtl_kv_max < needed_max) {
+        if (ctx->mtl_kv_k != METAL_BUF_INVALID) metal_buf_release(ctx->mtl_kv_k);
+        if (ctx->mtl_kv_v != METAL_BUF_INVALID) metal_buf_release(ctx->mtl_kv_v);
+        ctx->mtl_kv_k = metal_buf_create_empty(kv_elems * sizeof(float));
+        ctx->mtl_kv_v = metal_buf_create_empty(kv_elems * sizeof(float));
+        if (ctx->mtl_kv_k == METAL_BUF_INVALID || ctx->mtl_kv_v == METAL_BUF_INVALID) return -1;
+
+        float *gpu_k = (float *)metal_buf_contents(ctx->mtl_kv_k);
+        float *gpu_v = (float *)metal_buf_contents(ctx->mtl_kv_v);
+        if (!gpu_k || !gpu_v) return -1;
+        size_t layer_stride = (size_t)needed_max * kv_dim;
+        size_t copy_tokens = (size_t)(prefill_len > 0 ? prefill_len : 0);
+        if (copy_tokens > (size_t)needed_max) copy_tokens = (size_t)needed_max;
+        for (int l = 0; l < layers; l++) {
+            float *dst_k = gpu_k + (size_t)l * layer_stride;
+            float *dst_v = gpu_v + (size_t)l * layer_stride;
+            float *src_k = ctx->talker_kv_k + (size_t)l * layer_stride;
+            float *src_v = ctx->talker_kv_v + (size_t)l * layer_stride;
+            if (copy_tokens > 0) {
+                memcpy(dst_k, src_k, copy_tokens * kv_dim * sizeof(float));
+                memcpy(dst_v, src_v, copy_tokens * kv_dim * sizeof(float));
+            }
+        }
+        ctx->mtl_kv_max = needed_max;
+    }
+
+    ctx->mtl_scores = metal_buf_ensure(ctx->mtl_scores, scores_elems * sizeof(float));
+    return ctx->mtl_scores == METAL_BUF_INVALID ? -1 : 0;
+}
+
+static int should_use_metal_talker(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("QWEN_TTS_METAL_TALKER");
+        enabled = (env && atoi(env) != 0) ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
 }
 
 static void talker_attention_single_metal(
@@ -154,6 +232,12 @@ static void talker_attention_single_metal(
     const float *sin_val,
     int pos
 ) {
+    (void)x_norm;
+    (void)q_buf;
+    (void)k_buf;
+    (void)v_buf;
+    (void)attn_out;
+
     qwen_tts_config_t *cfg = &ctx->config;
     qwen_tts_talker_layer_t *layer = &ctx->talker.layers[layer_idx];
     int hidden = cfg->talker_hidden;
@@ -161,120 +245,61 @@ static void talker_attention_single_metal(
     int kv_heads = cfg->talker_kv_heads;
     int head_dim = cfg->talker_head_dim;
     int kv_dim = kv_heads * head_dim;
-    int groups_per_head = num_heads / kv_heads;
     float eps = cfg->talker_rms_norm_eps;
     int intermediate = cfg->talker_intermediate;
-
-    ensure_talker_metal_scratch(ctx);
-
-    /* === Phase 1: GPU-accelerated projections === */
-    /* Write x directly into shared Metal buffer (zero-copy on Apple Silicon) */
-    memcpy(metal_buf_contents(ctx->mtl_x), x, hidden * sizeof(float));
-
-    metal_begin();
-    metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_input_norm, hidden, eps);
-    metal_matvec_bf16(ctx->mtl_q, layer->mtl_wq, ctx->mtl_x_norm, num_heads * head_dim, hidden);
-    metal_matvec_bf16(ctx->mtl_k, layer->mtl_wk, ctx->mtl_x_norm, kv_dim, hidden);
-    metal_matvec_bf16(ctx->mtl_v, layer->mtl_wv, ctx->mtl_x_norm, kv_dim, hidden);
-    metal_sync();
-
-    /* Read Q, K, V directly from shared Metal buffers */
-    memcpy(q_buf, metal_buf_contents(ctx->mtl_q), num_heads * head_dim * sizeof(float));
-    memcpy(k_buf, metal_buf_contents(ctx->mtl_k), kv_dim * sizeof(float));
-    memcpy(v_buf, metal_buf_contents(ctx->mtl_v), kv_dim * sizeof(float));
-
-    /* === Phase 2: CPU-side QK-Norm, M-RoPE, attention === */
-    /* QK-Norm per head */
-    for (int h = 0; h < num_heads; h++)
-        kernel_rms_norm_inplace(q_buf + h * head_dim, layer->q_norm_weight, head_dim, eps);
-    for (int h = 0; h < kv_heads; h++)
-        kernel_rms_norm_inplace(k_buf + h * head_dim, layer->k_norm_weight, head_dim, eps);
-
-    /* M-RoPE */
-    {
-        int sec[6];
-        sec[0] = cfg->mrope_section[0]; sec[1] = cfg->mrope_section[1]; sec[2] = cfg->mrope_section[2];
-        sec[3] = cfg->mrope_section[0]; sec[4] = cfg->mrope_section[1]; sec[5] = cfg->mrope_section[2];
-        float cos_m[512], sin_m[512];
-        int d = 0;
-        for (int chunk = 0; chunk < 6; chunk++) {
-            int stream = chunk % 3;
-            for (int i = 0; i < sec[chunk] && d < head_dim; i++, d++) {
-                cos_m[d] = cos[stream * head_dim + d];
-                sin_m[d] = sin_val[stream * head_dim + d];
-            }
-        }
-        int half = head_dim / 2;
-        for (int h = 0; h < num_heads; h++) {
-            float *qh = q_buf + h * head_dim;
-            for (int i = 0; i < half; i++) {
-                float q0 = qh[i], q1 = qh[i + half];
-                qh[i]        = q0 * cos_m[i] - q1 * sin_m[i];
-                qh[i + half] = q1 * cos_m[i + half] + q0 * sin_m[i + half];
-            }
-        }
-        for (int h = 0; h < kv_heads; h++) {
-            float *kh = k_buf + h * head_dim;
-            for (int i = 0; i < half; i++) {
-                float k0 = kh[i], k1 = kh[i + half];
-                kh[i]        = k0 * cos_m[i] - k1 * sin_m[i];
-                kh[i + half] = k1 * cos_m[i + half] + k0 * sin_m[i + half];
-            }
-        }
-    }
-
-    /* Store K, V into KV cache */
-    size_t kv_stride = (size_t)ctx->talker_kv_max * kv_dim;
-    float *cache_k = ctx->talker_kv_k + (size_t)layer_idx * kv_stride + (size_t)pos * kv_dim;
-    float *cache_v = ctx->talker_kv_v + (size_t)layer_idx * kv_stride + (size_t)pos * kv_dim;
-    memcpy(cache_k, k_buf, kv_dim * sizeof(float));
-    memcpy(cache_v, v_buf, kv_dim * sizeof(float));
-
-    /* Attention: Q @ K^T, scaled, causal (single query pos) */
     int seq_len = pos + 1;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    for (int h = 0; h < num_heads; h++) {
-        int kv_h = h / groups_per_head;
-        float *qh = q_buf + h * head_dim;
-        float *scores = ctx->tk_scores;
+    if (ensure_talker_metal_scratch(ctx) != 0) return;
+    float *mtl_x_ptr = (float *)metal_buf_contents(ctx->mtl_x);
 
-        for (int t = 0; t < seq_len; t++) {
-            float *kt = ctx->talker_kv_k + (size_t)layer_idx * kv_stride + (size_t)t * kv_dim + kv_h * head_dim;
-            float score = st_dot(qh, kt, head_dim) * scale;
-            scores[t] = score;
-        }
-
-        kernel_softmax(scores, seq_len);
-
-        float *oh = attn_out + h * head_dim;
-        memset(oh, 0, head_dim * sizeof(float));
-        for (int t = 0; t < seq_len; t++) {
-            float *vt = ctx->talker_kv_v + (size_t)layer_idx * kv_stride + (size_t)t * kv_dim + kv_h * head_dim;
-            st_axpy(head_dim, scores[t], vt, oh);
-        }
+    /* Write x directly into shared Metal buffer (zero-copy on Apple Silicon). */
+    if (x != mtl_x_ptr) {
+        memcpy(mtl_x_ptr, x, hidden * sizeof(float));
     }
 
-    /* === Phase 3: GPU-accelerated output proj + MLP === */
-    memcpy(metal_buf_contents(ctx->mtl_attn_out), attn_out, num_heads * head_dim * sizeof(float));
+    /* Build merged M-RoPE cos/sin once for this token. */
+    int sec[6];
+    sec[0] = cfg->mrope_section[0]; sec[1] = cfg->mrope_section[1]; sec[2] = cfg->mrope_section[2];
+    sec[3] = cfg->mrope_section[0]; sec[4] = cfg->mrope_section[1]; sec[5] = cfg->mrope_section[2];
+    float cos_m[512], sin_m[512];
+    int d = 0;
+    for (int chunk = 0; chunk < 6; chunk++) {
+        int stream = chunk % 3;
+        for (int i = 0; i < sec[chunk] && d < head_dim; i++, d++) {
+            cos_m[d] = cos[stream * head_dim + d];
+            sin_m[d] = sin_val[stream * head_dim + d];
+        }
+    }
+    metal_buf_write(ctx->mtl_rope_cos, cos_m, head_dim * sizeof(float));
+    metal_buf_write(ctx->mtl_rope_sin, sin_m, head_dim * sizeof(float));
 
-    metal_begin();
-    /* Output projection */
+    metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_input_norm, hidden, eps);
+    metal_qkv_matvec_bf16(ctx->mtl_q, ctx->mtl_k, ctx->mtl_v,
+                          layer->mtl_wq, layer->mtl_wk, layer->mtl_wv,
+                          ctx->mtl_x_norm, num_heads, kv_heads, head_dim, hidden);
+    metal_qk_norm_rope(ctx->mtl_q, ctx->mtl_k, layer->mtl_q_norm, layer->mtl_k_norm,
+                       ctx->mtl_rope_cos, ctx->mtl_rope_sin,
+                       num_heads, kv_heads, head_dim, eps);
+    metal_kv_cache_store(ctx->mtl_kv_k, ctx->mtl_kv_v, ctx->mtl_k, ctx->mtl_v,
+                         layer_idx, pos, kv_dim, ctx->mtl_kv_max);
+    metal_attn_scores(ctx->mtl_scores, ctx->mtl_q, ctx->mtl_kv_k,
+                      layer_idx, seq_len, ctx->mtl_kv_max,
+                      num_heads, kv_heads, head_dim, scale);
+    metal_attn_softmax_rows(ctx->mtl_scores, num_heads, seq_len, ctx->mtl_kv_max);
+    metal_attn_weighted_sum(ctx->mtl_attn_out, ctx->mtl_scores, ctx->mtl_kv_v,
+                            layer_idx, seq_len, ctx->mtl_kv_max,
+                            num_heads, kv_heads, head_dim);
+
+    /* Output projection + MLP */
     metal_matvec_bf16(ctx->mtl_x_norm, layer->mtl_wo, ctx->mtl_attn_out, hidden, num_heads * head_dim);
-    /* Residual add */
     metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, hidden);
-    /* Post-attention norm */
     metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_post_attn_norm, hidden, eps);
-    /* Fused SwiGLU: gate_out = silu(gate @ x) * (up @ x) in one dispatch */
     metal_swiglu_matvec_bf16(ctx->mtl_gate, layer->mtl_gate_up_fused, ctx->mtl_x_norm, intermediate, hidden);
-    /* Down projection */
     metal_matvec_bf16(ctx->mtl_x_norm, layer->mtl_down, ctx->mtl_gate, hidden, intermediate);
-    /* Residual add */
     metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, hidden);
-    metal_sync();
 
-    /* Read x directly from shared Metal buffer */
-    memcpy(x, metal_buf_contents(ctx->mtl_x), hidden * sizeof(float));
+    (void)mtl_x_ptr;
 }
 
 #endif /* USE_METAL */
@@ -680,18 +705,79 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
         ctx->tk_scores = (float *)malloc(ctx->talker_kv_max * sizeof(float));
     }
 
+    int use_metal_talker = 0;
+#ifdef USE_METAL
+    use_metal_talker = metal_is_available() && should_use_metal_talker();
+#endif
+
     float *x = ctx->tk_x;
+#ifdef USE_METAL
+    if (use_metal_talker) {
+        if (ensure_talker_metal_scratch(ctx) == 0 &&
+            ensure_talker_metal_kv_cache(ctx, pos) == 0) {
+            x = (float *)metal_buf_contents(ctx->mtl_x);
+        } else {
+            use_metal_talker = 0;
+        }
+    }
+#endif
     memcpy(x, input_embed, hidden * sizeof(float));
 
     /* Compute M-RoPE cos/sin for this position */
     float cos_mrope[3 * 512], sin_mrope[3 * 512];
     compute_mrope_pos(cos_mrope, sin_mrope, pos, head_dim, cfg->talker_rope_theta);
 
+    int trace_layers = should_trace_layers();
+    double layer_ms[QWEN_TTS_MAX_TALKER_LAYERS] = {0};
+    int batched_metal = 0;
+#ifdef USE_METAL
+    batched_metal = use_metal_talker && !trace_layers;
+    if (batched_metal) {
+        metal_begin();
+    }
+#endif
+
     /* Process each layer */
     for (int layer = 0; layer < cfg->talker_layers; layer++) {
+        double t_layer = trace_layers ? talker_now_ms() : 0.0;
+#ifdef USE_METAL
+        if (use_metal_talker) {
+            if (trace_layers) metal_begin();
+            talker_attention_single_metal(ctx, layer, x, ctx->tk_x_norm,
+                                          ctx->tk_q, ctx->tk_k, ctx->tk_v,
+                                          ctx->tk_attn_out, cos_mrope, sin_mrope, pos);
+            if (trace_layers) {
+                metal_sync();
+                layer_ms[layer] = talker_now_ms() - t_layer;
+            }
+            continue;
+        }
+#endif
         talker_attention_single(ctx, layer, x, ctx->tk_x_norm,
                                 ctx->tk_q, ctx->tk_k, ctx->tk_v,
                                 ctx->tk_attn_out, cos_mrope, sin_mrope, pos);
+        if (trace_layers) layer_ms[layer] = talker_now_ms() - t_layer;
+    }
+
+#ifdef USE_METAL
+    if (batched_metal) {
+        metal_sync();
+    }
+#endif
+
+    if (trace_layers) {
+        double total = 0.0;
+        for (int i = 0; i < cfg->talker_layers; i++) total += layer_ms[i];
+        fprintf(stderr, "[layer-trace] token=%d path=%s total=%.3f ms\n",
+                pos, use_metal_talker ? "metal" : "cpu", total);
+        for (int i = 0; i < cfg->talker_layers; i++) {
+            fprintf(stderr, "  [layer-trace] L%02d %.3f ms\n", i, layer_ms[i]);
+        }
+    }
+
+    if (x != ctx->tk_x) {
+        memcpy(ctx->tk_x, x, hidden * sizeof(float));
+        x = ctx->tk_x;
     }
 
     /* Final norm + codec head projection (CPU — small ops, AMX is faster) */

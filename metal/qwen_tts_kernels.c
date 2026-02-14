@@ -890,7 +890,15 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
 /* ======================================================================== */
 
 void kernel_init(void) {
-    /* Metal GPU initialization is deferred to first use (lazy init).
-     * For the current model dimensions, CPU (Accelerate AMX) is faster
-     * than Metal for both single-token matvec and batch matmul. */
+#ifdef USE_METAL
+    const char *enable_env = getenv("QWEN_TTS_ENABLE_METAL");
+    const char *talker_env = getenv("QWEN_TTS_METAL_TALKER");
+    int want_metal = ((enable_env && atoi(enable_env) != 0) ||
+                      (talker_env && atoi(talker_env) != 0));
+    if (!want_metal) return;
+
+    if (metal_init() != 0 && qwen_tts_verbose >= 1) {
+        fprintf(stderr, "Metal: initialization failed, using CPU kernels only\n");
+    }
+#endif
 }

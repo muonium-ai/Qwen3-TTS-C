@@ -36,6 +36,13 @@ struct Params {
     int hidden;
     int channels;
     int n;
+    int kv_heads;
+    int groups_per_head;
+    int kv_dim;
+    int kv_max;
+    int seq_len;
+    int layer_idx;
+    int pos;
 };
 
 /* BF16 to F32 conversion */
@@ -332,6 +339,241 @@ kernel void kernel_softmax_metal(
     for (int i = (int)tid; i < p.n; i += (int)tg_size) {
         x[i] *= inv_sum;
     }
+}
+
+/* ========================================================================
+ * Fused QKV matvec (BF16): computes Q, K, V in one dispatch
+ * q rows: [num_heads * head_dim], k/v rows: [kv_heads * head_dim]
+ * ======================================================================== */
+
+kernel void kernel_qkv_matvec_bf16_metal(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    device float *v [[buffer(2)]],
+    const device ushort *wq_bf16 [[buffer(3)]],
+    const device ushort *wk_bf16 [[buffer(4)]],
+    const device ushort *wv_bf16 [[buffer(5)]],
+    const device float *x [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int q_rows = p.num_heads * p.head_dim;
+    int kv_rows = p.kv_heads * p.head_dim;
+    int total_rows = q_rows + kv_rows + kv_rows;
+    int row = (int)gid;
+    if (row >= total_rows) return;
+
+    const device ushort *w_row = nullptr;
+    device float *out = nullptr;
+    int out_row = 0;
+    if (row < q_rows) {
+        w_row = wq_bf16 + (long)row * p.hidden;
+        out = q;
+        out_row = row;
+    } else if (row < q_rows + kv_rows) {
+        int r = row - q_rows;
+        w_row = wk_bf16 + (long)r * p.hidden;
+        out = k;
+        out_row = r;
+    } else {
+        int r = row - q_rows - kv_rows;
+        w_row = wv_bf16 + (long)r * p.hidden;
+        out = v;
+        out_row = r;
+    }
+
+    const device float4 *x4 = (const device float4 *)x;
+    float4 acc = float4(0.0f);
+    int c4 = p.hidden / 4;
+    for (int i = 0; i < c4; i++) {
+        int base = i * 4;
+        float4 a4 = float4(bf16_to_f32(w_row[base]),
+                           bf16_to_f32(w_row[base + 1]),
+                           bf16_to_f32(w_row[base + 2]),
+                           bf16_to_f32(w_row[base + 3]));
+        acc += a4 * x4[i];
+    }
+    float sum = acc.x + acc.y + acc.z + acc.w;
+    for (int c = c4 * 4; c < p.hidden; c++) {
+        sum += bf16_to_f32(w_row[c]) * x[c];
+    }
+    out[out_row] = sum;
+}
+
+/* ========================================================================
+ * Fused QK RMSNorm + RoPE (single token)
+ * One threadgroup per head (Q heads first, then KV heads).
+ * ======================================================================== */
+
+kernel void kernel_qk_norm_rope_metal(
+    device float *q [[buffer(0)]],
+    device float *k [[buffer(1)]],
+    const device float *q_norm_weight [[buffer(2)]],
+    const device float *k_norm_weight [[buffer(3)]],
+    const device float *cos_buf [[buffer(4)]],
+    const device float *sin_buf [[buffer(5)]],
+    constant Params &p [[buffer(6)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    int head = (int)tg_id;
+    int total_heads = p.num_heads + p.kv_heads;
+    if (head >= total_heads) return;
+
+    bool is_q = head < p.num_heads;
+    int local_head = is_q ? head : (head - p.num_heads);
+    device float *vec = is_q ? (q + (long)local_head * p.head_dim)
+                             : (k + (long)local_head * p.head_dim);
+    const device float *weight = is_q ? q_norm_weight : k_norm_weight;
+
+    threadgroup float shared_sum[256];
+    float local_ss = 0.0f;
+    for (int i = (int)tid; i < p.head_dim; i += (int)tg_size) {
+        float v0 = vec[i];
+        local_ss += v0 * v0;
+    }
+    shared_sum[tid] = local_ss;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_sum[tid] += shared_sum[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float inv = 1.0f / sqrt(shared_sum[0] / float(p.head_dim) + p.eps);
+    for (int i = (int)tid; i < p.head_dim; i += (int)tg_size) {
+        vec[i] = vec[i] * inv * weight[i];
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int half_dim = p.head_dim / 2;
+    for (int i = (int)tid; i < half_dim; i += (int)tg_size) {
+        float c = cos_buf[i];
+        float s = sin_buf[i];
+        float v0 = vec[i];
+        float v1 = vec[i + half_dim];
+        vec[i] = v0 * c - v1 * s;
+        vec[i + half_dim] = v1 * cos_buf[i + half_dim] + v0 * sin_buf[i + half_dim];
+    }
+}
+
+/* ========================================================================
+ * KV cache write for one layer/position
+ * kv layout: [layers, kv_max, kv_dim]
+ * ======================================================================== */
+
+kernel void kernel_kv_cache_store_metal(
+    device float *kv_k [[buffer(0)]],
+    device float *kv_v [[buffer(1)]],
+    const device float *k [[buffer(2)]],
+    const device float *v [[buffer(3)]],
+    constant Params &p [[buffer(4)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int i = (int)gid;
+    if (i >= p.kv_dim) return;
+    long base = ((long)p.layer_idx * p.kv_max + p.pos) * p.kv_dim;
+    kv_k[base + i] = k[i];
+    kv_v[base + i] = v[i];
+}
+
+/* ========================================================================
+ * Attention score compute for one token
+ * scores layout: [num_heads, kv_max], valid prefix [0, seq_len)
+ * ======================================================================== */
+
+kernel void kernel_attn_scores_metal(
+    device float *scores [[buffer(0)]],
+    const device float *q [[buffer(1)]],
+    const device float *kv_k [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int t = (int)gid.x;
+    int h = (int)gid.y;
+    if (t >= p.seq_len || h >= p.num_heads) return;
+
+    int kv_h = h / p.groups_per_head;
+    const device float *qh = q + (long)h * p.head_dim;
+    const device float *kh = kv_k + ((long)p.layer_idx * p.kv_max + t) * p.kv_dim +
+                             (long)kv_h * p.head_dim;
+
+    float sum = 0.0f;
+    for (int i = 0; i < p.head_dim; i++) {
+        sum += qh[i] * kh[i];
+    }
+    scores[(long)h * p.kv_max + t] = sum * p.scale;
+}
+
+/* Softmax over each head row in scores[num_heads, kv_max], prefix seq_len */
+kernel void kernel_attn_softmax_rows_metal(
+    device float *scores [[buffer(0)]],
+    constant Params &p [[buffer(1)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    if ((int)head >= p.num_heads) return;
+
+    threadgroup float shared_val[256];
+    long row_base = (long)head * p.kv_max;
+
+    float local_max = -INFINITY;
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        local_max = max(local_max, scores[row_base + t]);
+    }
+    shared_val[tid] = local_max;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_val[tid] = max(shared_val[tid], shared_val[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_val[0];
+
+    float local_sum = 0.0f;
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        float e = exp(scores[row_base + t] - max_val);
+        scores[row_base + t] = e;
+        local_sum += e;
+    }
+    shared_val[tid] = local_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_val[tid] += shared_val[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_val[0];
+
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        scores[row_base + t] *= inv_sum;
+    }
+}
+
+/* Weighted sum: out[h, d] = sum_t scores[h, t] * v[layer, t, kv_h, d] */
+kernel void kernel_attn_weighted_sum_metal(
+    device float *out [[buffer(0)]],
+    const device float *scores [[buffer(1)]],
+    const device float *kv_v [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    int d = (int)gid.x;
+    int h = (int)gid.y;
+    if (d >= p.head_dim || h >= p.num_heads) return;
+
+    int kv_h = h / p.groups_per_head;
+    float sum = 0.0f;
+    long row_base = (long)h * p.kv_max;
+    for (int t = 0; t < p.seq_len; t++) {
+        float w = scores[row_base + t];
+        const device float *vh = kv_v + ((long)p.layer_idx * p.kv_max + t) * p.kv_dim +
+                                 (long)kv_h * p.head_dim;
+        sum += w * vh[d];
+    }
+    out[(long)h * p.head_dim + d] = sum;
 }
 
 /* ========================================================================

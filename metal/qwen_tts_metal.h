@@ -98,6 +98,11 @@ void metal_commit(void);
 void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
                        int rows, int cols);
 
+/* Fused QKV projection: computes Q, K, V matvecs in one dispatch */
+void metal_qkv_matvec_bf16(metal_buf_t q, metal_buf_t k, metal_buf_t v,
+                           metal_buf_t wq_bf16, metal_buf_t wk_bf16, metal_buf_t wv_bf16,
+                           metal_buf_t x, int num_heads, int kv_heads, int head_dim, int hidden);
+
 /* out[rows] = A[rows, cols] @ x[cols]  (all F32) */
 void metal_matvec_f32(metal_buf_t out, metal_buf_t A, metal_buf_t x,
                       int rows, int cols);
@@ -128,6 +133,26 @@ void metal_layer_norm(metal_buf_t out, metal_buf_t x, metal_buf_t weight,
 
 /* Softmax over n elements (in-place) */
 void metal_softmax(metal_buf_t x, int n);
+
+/* Fused Q/K RMSNorm + RoPE for single-token attention */
+void metal_qk_norm_rope(metal_buf_t q, metal_buf_t k,
+                        metal_buf_t q_norm_weight, metal_buf_t k_norm_weight,
+                        metal_buf_t cos_buf, metal_buf_t sin_buf,
+                        int num_heads, int kv_heads, int head_dim, float eps);
+
+/* KV cache write: store current k,v into [layer_idx, pos] */
+void metal_kv_cache_store(metal_buf_t kv_k, metal_buf_t kv_v,
+                          metal_buf_t k, metal_buf_t v,
+                          int layer_idx, int pos, int kv_dim, int kv_max);
+
+/* Single-token attention kernels over KV cache */
+void metal_attn_scores(metal_buf_t scores, metal_buf_t q, metal_buf_t kv_k,
+                       int layer_idx, int seq_len, int kv_max,
+                       int num_heads, int kv_heads, int head_dim, float scale);
+void metal_attn_softmax_rows(metal_buf_t scores, int num_heads, int seq_len, int kv_max);
+void metal_attn_weighted_sum(metal_buf_t out, metal_buf_t scores, metal_buf_t kv_v,
+                             int layer_idx, int seq_len, int kv_max,
+                             int num_heads, int kv_heads, int head_dim);
 
 /* --- Activations --- */
 

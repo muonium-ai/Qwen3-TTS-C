@@ -32,6 +32,7 @@ typedef struct {
 
     /* Pipeline states (one per kernel) */
     id<MTLComputePipelineState> ps_matvec_bf16;
+    id<MTLComputePipelineState> ps_qkv_matvec_bf16;
     id<MTLComputePipelineState> ps_matvec_f32;
     id<MTLComputePipelineState> ps_matmul_f32;
     id<MTLComputePipelineState> ps_matmul_bf16;
@@ -39,6 +40,11 @@ typedef struct {
     id<MTLComputePipelineState> ps_rms_norm_inplace;
     id<MTLComputePipelineState> ps_layer_norm;
     id<MTLComputePipelineState> ps_softmax;
+    id<MTLComputePipelineState> ps_qk_norm_rope;
+    id<MTLComputePipelineState> ps_kv_cache_store;
+    id<MTLComputePipelineState> ps_attn_scores;
+    id<MTLComputePipelineState> ps_attn_softmax_rows;
+    id<MTLComputePipelineState> ps_attn_weighted_sum;
     id<MTLComputePipelineState> ps_silu_inplace;
     id<MTLComputePipelineState> ps_gelu_inplace;
     id<MTLComputePipelineState> ps_snake_beta;
@@ -192,6 +198,7 @@ int metal_init(void) {
 
         /* Create all pipeline states */
         g_metal.ps_matvec_bf16 = create_pipeline("kernel_matvec_bf16_metal");
+        g_metal.ps_qkv_matvec_bf16 = create_pipeline("kernel_qkv_matvec_bf16_metal");
         g_metal.ps_matvec_f32 = create_pipeline("kernel_matvec_f32_metal");
         g_metal.ps_matmul_f32 = create_pipeline("kernel_matmul_f32_metal");
         g_metal.ps_matmul_bf16 = create_pipeline("kernel_matmul_bf16_metal");
@@ -199,6 +206,11 @@ int metal_init(void) {
         g_metal.ps_rms_norm_inplace = create_pipeline("kernel_rms_norm_inplace_metal");
         g_metal.ps_layer_norm = create_pipeline("kernel_layer_norm_metal");
         g_metal.ps_softmax = create_pipeline("kernel_softmax_metal");
+        g_metal.ps_qk_norm_rope = create_pipeline("kernel_qk_norm_rope_metal");
+        g_metal.ps_kv_cache_store = create_pipeline("kernel_kv_cache_store_metal");
+        g_metal.ps_attn_scores = create_pipeline("kernel_attn_scores_metal");
+        g_metal.ps_attn_softmax_rows = create_pipeline("kernel_attn_softmax_rows_metal");
+        g_metal.ps_attn_weighted_sum = create_pipeline("kernel_attn_weighted_sum_metal");
         g_metal.ps_silu_inplace = create_pipeline("kernel_silu_inplace_metal");
         g_metal.ps_gelu_inplace = create_pipeline("kernel_gelu_inplace_metal");
         g_metal.ps_snake_beta = create_pipeline("kernel_snake_beta_metal");
@@ -456,6 +468,13 @@ typedef struct {
     int hidden;
     int channels;
     int n;
+    int kv_heads;
+    int groups_per_head;
+    int kv_dim;
+    int kv_max;
+    int seq_len;
+    int layer_idx;
+    int pos;
 } metal_params_t;
 
 void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
@@ -468,6 +487,27 @@ void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
         metal_params_t p = {.rows = rows, .cols = cols};
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         dispatch_1d(enc, g_metal.ps_matvec_bf16, rows);
+    }
+}
+
+void metal_qkv_matvec_bf16(metal_buf_t q, metal_buf_t k, metal_buf_t v,
+                           metal_buf_t wq_bf16, metal_buf_t wk_bf16, metal_buf_t wv_bf16,
+                           metal_buf_t x, int num_heads, int kv_heads, int head_dim, int hidden) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_qkv_matvec_bf16);
+        [enc setBuffer:g_metal.buffers[q] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[k] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[v] offset:0 atIndex:2];
+        [enc setBuffer:g_metal.buffers[wq_bf16] offset:0 atIndex:3];
+        [enc setBuffer:g_metal.buffers[wk_bf16] offset:0 atIndex:4];
+        [enc setBuffer:g_metal.buffers[wv_bf16] offset:0 atIndex:5];
+        [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:6];
+        metal_params_t p = {.num_heads = num_heads, .kv_heads = kv_heads, .head_dim = head_dim, .hidden = hidden};
+        [enc setBytes:&p length:sizeof(p) atIndex:7];
+        int q_rows = num_heads * head_dim;
+        int kv_rows = kv_heads * head_dim;
+        int total_rows = q_rows + kv_rows + kv_rows;
+        dispatch_1d(enc, g_metal.ps_qkv_matvec_bf16, total_rows);
     }
 }
 
@@ -577,6 +617,95 @@ void metal_softmax(metal_buf_t x, int n) {
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
         [enc endEncoding];
+    }
+}
+
+void metal_qk_norm_rope(metal_buf_t q, metal_buf_t k,
+                        metal_buf_t q_norm_weight, metal_buf_t k_norm_weight,
+                        metal_buf_t cos_buf, metal_buf_t sin_buf,
+                        int num_heads, int kv_heads, int head_dim, float eps) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_qk_norm_rope);
+        [enc setBuffer:g_metal.buffers[q] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[k] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[q_norm_weight] offset:0 atIndex:2];
+        [enc setBuffer:g_metal.buffers[k_norm_weight] offset:0 atIndex:3];
+        [enc setBuffer:g_metal.buffers[cos_buf] offset:0 atIndex:4];
+        [enc setBuffer:g_metal.buffers[sin_buf] offset:0 atIndex:5];
+        metal_params_t p = {.num_heads = num_heads, .kv_heads = kv_heads, .head_dim = head_dim, .eps = eps};
+        [enc setBytes:&p length:sizeof(p) atIndex:6];
+        NSUInteger tg = 128;
+        if ((NSUInteger)head_dim < tg) tg = (NSUInteger)head_dim;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(num_heads + kv_heads), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
+void metal_kv_cache_store(metal_buf_t kv_k, metal_buf_t kv_v,
+                          metal_buf_t k, metal_buf_t v,
+                          int layer_idx, int pos, int kv_dim, int kv_max) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_kv_cache_store);
+        [enc setBuffer:g_metal.buffers[kv_k] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[kv_v] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[k] offset:0 atIndex:2];
+        [enc setBuffer:g_metal.buffers[v] offset:0 atIndex:3];
+        metal_params_t p = {.layer_idx = layer_idx, .pos = pos, .kv_dim = kv_dim, .kv_max = kv_max};
+        [enc setBytes:&p length:sizeof(p) atIndex:4];
+        dispatch_1d(enc, g_metal.ps_kv_cache_store, kv_dim);
+    }
+}
+
+void metal_attn_scores(metal_buf_t scores, metal_buf_t q, metal_buf_t kv_k,
+                       int layer_idx, int seq_len, int kv_max,
+                       int num_heads, int kv_heads, int head_dim, float scale) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_attn_scores);
+        [enc setBuffer:g_metal.buffers[scores] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[q] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[kv_k] offset:0 atIndex:2];
+        int groups_per_head = num_heads / kv_heads;
+        metal_params_t p = {.layer_idx = layer_idx, .seq_len = seq_len, .kv_max = kv_max,
+                            .num_heads = num_heads, .kv_heads = kv_heads, .head_dim = head_dim,
+                            .groups_per_head = groups_per_head, .kv_dim = kv_heads * head_dim, .scale = scale};
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch_2d(enc, g_metal.ps_attn_scores, seq_len, num_heads);
+    }
+}
+
+void metal_attn_softmax_rows(metal_buf_t scores, int num_heads, int seq_len, int kv_max) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_attn_softmax_rows);
+        [enc setBuffer:g_metal.buffers[scores] offset:0 atIndex:0];
+        metal_params_t p = {.num_heads = num_heads, .seq_len = seq_len, .kv_max = kv_max};
+        [enc setBytes:&p length:sizeof(p) atIndex:1];
+        NSUInteger tg = 256;
+        if ((NSUInteger)seq_len < tg) {
+            tg = 1;
+            while (tg < (NSUInteger)seq_len) tg <<= 1;
+            if (tg > 256) tg = 256;
+        }
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
+    }
+}
+
+void metal_attn_weighted_sum(metal_buf_t out, metal_buf_t scores, metal_buf_t kv_v,
+                             int layer_idx, int seq_len, int kv_max,
+                             int num_heads, int kv_heads, int head_dim) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_attn_weighted_sum);
+        [enc setBuffer:g_metal.buffers[out] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[scores] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[kv_v] offset:0 atIndex:2];
+        int groups_per_head = num_heads / kv_heads;
+        metal_params_t p = {.layer_idx = layer_idx, .seq_len = seq_len, .kv_max = kv_max,
+                            .num_heads = num_heads, .kv_heads = kv_heads, .head_dim = head_dim,
+                            .groups_per_head = groups_per_head, .kv_dim = kv_heads * head_dim};
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch_2d(enc, g_metal.ps_attn_weighted_sum, head_dim, num_heads);
     }
 }
 
