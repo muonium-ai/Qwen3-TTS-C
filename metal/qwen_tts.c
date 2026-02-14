@@ -801,6 +801,38 @@ static int ensure_codec_loaded(qwen_tts_ctx_t *ctx) {
     }
     ctx->codec_safetensors = cms;
     load_codec_weights(ctx, cms);
+
+#ifdef USE_METAL
+    /* Upload codec weights to Metal buffers */
+    if (metal_is_available()) {
+        qwen_tts_config_t *ccfg = &ctx->config;
+        int codec_hidden = ccfg->codec_hidden;
+        int codec_intermediate = ccfg->codec_intermediate;
+        int heads = ccfg->codec_heads;
+        int kv_heads_c = ccfg->codec_kv_heads;
+        int hd = codec_hidden / heads;
+        int kvd = kv_heads_c * hd;
+
+        for (int i = 0; i < ccfg->codec_layers; i++) {
+            qwen_tts_codec_transformer_layer_t *l = &ctx->codec.transformer_layers[i];
+            if (l->input_norm) l->mtl_input_norm = metal_buf_create(l->input_norm, codec_hidden * sizeof(float));
+            if (l->post_attn_norm) l->mtl_post_attn_norm = metal_buf_create(l->post_attn_norm, codec_hidden * sizeof(float));
+            if (l->attn_layer_scale) l->mtl_attn_layer_scale = metal_buf_create(l->attn_layer_scale, codec_hidden * sizeof(float));
+            if (l->mlp_layer_scale) l->mtl_mlp_layer_scale = metal_buf_create(l->mlp_layer_scale, codec_hidden * sizeof(float));
+            if (l->wq) l->mtl_wq = metal_buf_from_ptr(l->wq, (size_t)heads * hd * codec_hidden * sizeof(float));
+            if (l->wk) l->mtl_wk = metal_buf_from_ptr(l->wk, (size_t)kvd * codec_hidden * sizeof(float));
+            if (l->wv) l->mtl_wv = metal_buf_from_ptr(l->wv, (size_t)kvd * codec_hidden * sizeof(float));
+            if (l->wo) l->mtl_wo = metal_buf_from_ptr(l->wo, (size_t)codec_hidden * heads * hd * sizeof(float));
+            if (l->gate) l->mtl_gate = metal_buf_from_ptr(l->gate, (size_t)codec_intermediate * codec_hidden * sizeof(float));
+            if (l->up) l->mtl_up = metal_buf_from_ptr(l->up, (size_t)codec_intermediate * codec_hidden * sizeof(float));
+            if (l->down) l->mtl_down = metal_buf_from_ptr(l->down, (size_t)codec_hidden * codec_intermediate * sizeof(float));
+        }
+
+        if (qwen_tts_verbose >= 1)
+            fprintf(stderr, "Metal: uploaded codec weights\n");
+    }
+#endif
+
     return 0;
 }
 
@@ -900,6 +932,65 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 #endif
 
     kernel_init();
+
+#ifdef USE_METAL
+    /* Upload weights to Metal GPU buffers */
+    if (metal_is_available()) {
+        double t_metal = time_ms();
+        qwen_tts_config_t *mcfg = &ctx->config;
+        int hidden = mcfg->talker_hidden;
+        int kv_dim = mcfg->talker_kv_heads * mcfg->talker_head_dim;
+        int intermediate = mcfg->talker_intermediate;
+        int num_heads = mcfg->talker_heads;
+        int head_dim = mcfg->talker_head_dim;
+
+        /* Talker embeddings and projections */
+        if (ctx->talker.codec_embedding_bf16)
+            ctx->talker.mtl_codec_embedding = metal_buf_from_ptr(ctx->talker.codec_embedding_bf16,
+                (size_t)mcfg->talker_vocab_size * hidden * sizeof(uint16_t));
+        if (ctx->talker.text_embedding_bf16)
+            ctx->talker.mtl_text_embedding = metal_buf_from_ptr(ctx->talker.text_embedding_bf16,
+                (size_t)mcfg->talker_text_vocab * mcfg->talker_text_hidden * sizeof(uint16_t));
+        if (ctx->talker.codec_head_bf16)
+            ctx->talker.mtl_codec_head = metal_buf_from_ptr(ctx->talker.codec_head_bf16,
+                (size_t)mcfg->talker_vocab_size * hidden * sizeof(uint16_t));
+        if (ctx->talker.norm)
+            ctx->talker.mtl_norm = metal_buf_create(ctx->talker.norm, hidden * sizeof(float));
+
+        /* Talker layer weights */
+        for (int i = 0; i < mcfg->talker_layers; i++) {
+            qwen_tts_talker_layer_t *l = &ctx->talker.layers[i];
+
+            if (l->wq_bf16) l->mtl_wq = metal_buf_from_ptr(l->wq_bf16,
+                (size_t)num_heads * head_dim * hidden * sizeof(uint16_t));
+            if (l->wk_bf16) l->mtl_wk = metal_buf_from_ptr(l->wk_bf16,
+                (size_t)kv_dim * hidden * sizeof(uint16_t));
+            if (l->wv_bf16) l->mtl_wv = metal_buf_from_ptr(l->wv_bf16,
+                (size_t)kv_dim * hidden * sizeof(uint16_t));
+            if (l->wo_bf16) l->mtl_wo = metal_buf_from_ptr(l->wo_bf16,
+                (size_t)hidden * num_heads * head_dim * sizeof(uint16_t));
+
+            if (l->q_norm_weight) l->mtl_q_norm = metal_buf_create(l->q_norm_weight,
+                head_dim * sizeof(float));
+            if (l->k_norm_weight) l->mtl_k_norm = metal_buf_create(l->k_norm_weight,
+                head_dim * sizeof(float));
+            if (l->input_norm) l->mtl_input_norm = metal_buf_create(l->input_norm,
+                hidden * sizeof(float));
+            if (l->post_attn_norm) l->mtl_post_attn_norm = metal_buf_create(l->post_attn_norm,
+                hidden * sizeof(float));
+
+            if (l->gate_bf16) l->mtl_gate = metal_buf_from_ptr(l->gate_bf16,
+                (size_t)intermediate * hidden * sizeof(uint16_t));
+            if (l->up_bf16) l->mtl_up = metal_buf_from_ptr(l->up_bf16,
+                (size_t)intermediate * hidden * sizeof(uint16_t));
+            if (l->down_bf16) l->mtl_down = metal_buf_from_ptr(l->down_bf16,
+                (size_t)hidden * intermediate * sizeof(uint16_t));
+        }
+
+        if (qwen_tts_verbose >= 1)
+            fprintf(stderr, "Metal: uploaded talker weights in %.1f ms\n", time_ms() - t_metal);
+    }
+#endif
 
     double t1 = time_ms();
     if (qwen_tts_verbose >= 1)

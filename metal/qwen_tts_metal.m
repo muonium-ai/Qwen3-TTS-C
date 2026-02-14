@@ -270,6 +270,35 @@ metal_buf_t metal_buf_create(const void *data, size_t size) {
     }
 }
 
+metal_buf_t metal_buf_from_ptr(void *ptr, size_t size) {
+    if (!g_metal.initialized || g_metal.buf_count >= METAL_MAX_BUFFERS || !ptr || size == 0)
+        return METAL_BUF_INVALID;
+    @autoreleasepool {
+        id<MTLBuffer> buf = nil;
+        /* Check if pointer is page-aligned for zero-copy */
+        uintptr_t addr = (uintptr_t)ptr;
+        size_t page_size = (size_t)getpagesize();
+        if ((addr % page_size) == 0) {
+            /* Page-aligned: zero-copy wrap. Round size up to page boundary. */
+            size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
+            buf = [g_metal.device newBufferWithBytesNoCopy:ptr
+                                                   length:aligned_size
+                                                  options:MTLResourceStorageModeShared
+                                              deallocator:nil];
+        }
+        if (!buf) {
+            /* Not page-aligned or NoCopy failed: copy data */
+            buf = [g_metal.device newBufferWithBytes:ptr
+                                              length:size
+                                             options:MTLResourceStorageModeShared];
+        }
+        if (!buf) return METAL_BUF_INVALID;
+        int idx = g_metal.buf_count++;
+        g_metal.buffers[idx] = buf;
+        return idx;
+    }
+}
+
 metal_buf_t metal_buf_create_empty(size_t size) {
     if (!g_metal.initialized || g_metal.buf_count >= METAL_MAX_BUFFERS) return METAL_BUF_INVALID;
     @autoreleasepool {

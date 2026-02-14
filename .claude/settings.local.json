@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Bash(xcrun:*)",
+      "Bash(xcode-select:*)",
+      "Bash(./qwen-tts-metal:*)",
+      "Bash(git commit:*)",
+      "Bash(git rm:*)",
+      "Bash(git add:*)",
+      "Bash(git push:*)"
+    ],
+    "additionalDirectories": [
+      "/Users/senthil/code/Qwen3-TTS-C/c"
+    ]
+  }
+}

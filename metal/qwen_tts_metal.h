@@ -45,8 +45,14 @@ typedef int metal_buf_t;  /* opaque buffer ID, -1 = invalid */
 
 #define METAL_BUF_INVALID (-1)
 
-/* Create a GPU buffer from CPU data. Returns buffer ID. */
+/* Create a GPU buffer from CPU data (copies data). Returns buffer ID. */
 metal_buf_t metal_buf_create(const void *data, size_t size);
+
+/* Wrap existing CPU pointer as a shared Metal buffer (zero-copy on unified memory).
+ * The pointer must remain valid for the lifetime of the buffer.
+ * For page-aligned pointers (e.g., mmap'd), uses newBufferWithBytesNoCopy.
+ * For unaligned pointers, copies data. */
+metal_buf_t metal_buf_from_ptr(void *ptr, size_t size);
 
 /* Create an empty GPU buffer of given size. */
 metal_buf_t metal_buf_create_empty(size_t size);

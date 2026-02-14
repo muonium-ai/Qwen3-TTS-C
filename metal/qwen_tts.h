@@ -169,6 +169,15 @@ typedef struct {
 
     /* Fused gate+up for single-token matvec */
     uint16_t *gate_up_fused_bf16; /* [2*intermediate, hidden] */
+
+#ifdef USE_METAL
+    /* Metal buffer IDs for GPU-accelerated forward pass */
+    int mtl_wq, mtl_wk, mtl_wv, mtl_wo;
+    int mtl_q_norm, mtl_k_norm;
+    int mtl_input_norm, mtl_post_attn_norm;
+    int mtl_gate, mtl_up, mtl_down;
+    int mtl_gate_up_fused;
+#endif
 } qwen_tts_talker_layer_t;
 
 typedef struct {
@@ -190,6 +199,14 @@ typedef struct {
 
     /* Codec head (logit projection, tied or separate) */
     uint16_t *codec_head_bf16;        /* [vocab, hidden] */
+
+#ifdef USE_METAL
+    int mtl_codec_embedding, mtl_text_embedding;
+    int mtl_text_proj_fc1, mtl_text_proj_fc1_bias;
+    int mtl_text_proj_fc2, mtl_text_proj_fc2_bias;
+    int mtl_norm;
+    int mtl_codec_head;
+#endif
 } qwen_tts_talker_t;
 
 /* ========================================================================
@@ -271,6 +288,13 @@ typedef struct {
     float *gate;                   /* [intermediate, hidden] */
     float *up;                     /* [intermediate, hidden] */
     float *down;                   /* [hidden, intermediate] */
+
+#ifdef USE_METAL
+    int mtl_input_norm, mtl_post_attn_norm;
+    int mtl_attn_layer_scale, mtl_mlp_layer_scale;
+    int mtl_wq, mtl_wk, mtl_wv, mtl_wo;
+    int mtl_gate, mtl_up, mtl_down;
+#endif
 } qwen_tts_codec_transformer_layer_t;
 
 /* ConvNeXt block */
@@ -436,6 +460,15 @@ typedef struct {
     double perf_talker_ms;
     double perf_codec_ms;
     int perf_codec_tokens;
+
+#ifdef USE_METAL
+    /* Metal scratch buffers for talker single-token path */
+    int mtl_x, mtl_x_norm, mtl_q, mtl_k, mtl_v;
+    int mtl_attn_out, mtl_gate, mtl_up;
+    int mtl_scores;
+    int mtl_kv_k, mtl_kv_v;     /* KV cache as Metal buffers */
+    int mtl_kv_max;              /* current Metal KV buffer capacity */
+#endif
 } qwen_tts_ctx_t;
 
 /* ========================================================================
