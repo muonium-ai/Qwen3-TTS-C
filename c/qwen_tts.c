@@ -477,6 +477,16 @@ static int load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         GET_BF16_CHECK(l->up_bf16, ms, name);
         snprintf(name, sizeof(name), "talker.model.layers.%d.mlp.down_proj.weight", i);
         GET_BF16_CHECK(l->down_bf16, ms, name);
+
+        /* Create fused gate+up weights for faster single-token SwiGLU MLP */
+        {
+            size_t gu_size = (size_t)cfg->talker_intermediate * cfg->talker_hidden;
+            l->gate_up_fused_bf16 = (uint16_t *)malloc(2 * gu_size * sizeof(uint16_t));
+            if (l->gate_up_fused_bf16) {
+                memcpy(l->gate_up_fused_bf16, l->gate_bf16, gu_size * sizeof(uint16_t));
+                memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
+            }
+        }
     }
 
     /* Final norm */

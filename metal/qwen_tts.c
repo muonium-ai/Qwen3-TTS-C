@@ -477,6 +477,18 @@ static int load_talker_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
         GET_BF16_CHECK(l->up_bf16, ms, name);
         snprintf(name, sizeof(name), "talker.model.layers.%d.mlp.down_proj.weight", i);
         GET_BF16_CHECK(l->down_bf16, ms, name);
+
+        /* Create fused gate+up weights for single-token MLP (used by Metal SwiGLU) */
+        {
+            size_t gu_size = (size_t)cfg->talker_intermediate * cfg->talker_hidden;
+            size_t fused_bytes = 2 * gu_size * sizeof(uint16_t);
+            void *fused_ptr = NULL;
+            if (posix_memalign(&fused_ptr, (size_t)getpagesize(), fused_bytes) == 0) {
+                l->gate_up_fused_bf16 = (uint16_t *)fused_ptr;
+                memcpy(l->gate_up_fused_bf16, l->gate_bf16, gu_size * sizeof(uint16_t));
+                memcpy(l->gate_up_fused_bf16 + gu_size, l->up_bf16, gu_size * sizeof(uint16_t));
+            }
+        }
     }
 
     /* Final norm */
@@ -1008,6 +1020,9 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
                 (size_t)intermediate * hidden * sizeof(uint16_t));
             if (l->down_bf16) l->mtl_down = metal_buf_from_ptr(l->down_bf16,
                 (size_t)hidden * intermediate * sizeof(uint16_t));
+            if (l->gate_up_fused_bf16) l->mtl_gate_up_fused = metal_buf_from_ptr(
+                l->gate_up_fused_bf16,
+                (size_t)2 * intermediate * hidden * sizeof(uint16_t));
         }
 
         if (qwen_tts_verbose >= 1)

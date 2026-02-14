@@ -235,14 +235,10 @@ static void talker_attention_single(
     kernel_rms_norm(x_norm, x, layer->post_attn_norm, hidden, eps);
 
     float *gate_buf = ctx->tk_gate;
-    float *up_buf = ctx->tk_up;
 
-    kernel_matvec_bf16(gate_buf, layer->gate_bf16, x_norm, cfg->talker_intermediate, hidden);
-    kernel_matvec_bf16(up_buf, layer->up_bf16, x_norm, cfg->talker_intermediate, hidden);
-
-    /* SiLU(gate) * up */
-    kernel_silu_inplace(gate_buf, cfg->talker_intermediate);
-    kernel_mul_inplace(gate_buf, up_buf, cfg->talker_intermediate);
+    /* Fused SwiGLU: gate_out = silu(gate @ x) * (up @ x) in one pass */
+    kernel_swiglu_matvec_bf16(gate_buf, layer->gate_up_fused_bf16, x_norm,
+                              cfg->talker_intermediate, hidden);
 
     /* down projection */
     kernel_matvec_bf16(proj_out, layer->down_bf16, gate_buf, hidden, cfg->talker_intermediate);

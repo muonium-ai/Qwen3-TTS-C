@@ -302,7 +302,6 @@ static void codec_transformer_forward_metal(qwen_tts_ctx_t *ctx, float *hidden,
     metal_begin();
     metal_matmul_f32(mtl_x, mtl_hidden, ctx->codec.mtl_input_proj_weight,
                      seq_len, codec_hidden, latent);
-    metal_commit();
     metal_sync();
 
     /* Add bias on CPU */
@@ -454,7 +453,6 @@ static void codec_transformer_forward_metal(qwen_tts_ctx_t *ctx, float *hidden,
     metal_begin();
     metal_matmul_f32(mtl_hidden, mtl_x, ctx->codec.mtl_output_proj_weight,
                      seq_len, latent, codec_hidden);
-    metal_commit();
     metal_sync();
 
     /* Copy result back + add bias */
@@ -476,12 +474,9 @@ static void codec_transformer_forward_metal(qwen_tts_ctx_t *ctx, float *hidden,
 
 static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
                                         int seq_len) {
-#ifdef USE_METAL
-    if (metal_is_available()) {
-        codec_transformer_forward_metal(ctx, hidden, seq_len);
-        return;
-    }
-#endif
+    /* Note: Metal codec path disabled — for seq_len ~40-80 and hidden=1024,
+     * Accelerate BLAS with AMX instructions is faster than Metal GPU dispatch.
+     * Metal codec path retained for future use with larger models/sequences. */
     qwen_tts_config_t *cfg = &ctx->config;
     int codec_hidden = cfg->codec_hidden;
     int latent = cfg->codec_latent;

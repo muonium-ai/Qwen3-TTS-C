@@ -168,8 +168,8 @@ static void talker_attention_single_metal(
     ensure_talker_metal_scratch(ctx);
 
     /* === Phase 1: GPU-accelerated projections === */
-    /* Upload x to Metal, run RMSNorm + Q/K/V matvecs on GPU */
-    metal_buf_write(ctx->mtl_x, x, hidden * sizeof(float));
+    /* Write x directly into shared Metal buffer (zero-copy on Apple Silicon) */
+    memcpy(metal_buf_contents(ctx->mtl_x), x, hidden * sizeof(float));
 
     metal_begin();
     metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_input_norm, hidden, eps);
@@ -178,10 +178,10 @@ static void talker_attention_single_metal(
     metal_matvec_bf16(ctx->mtl_v, layer->mtl_wv, ctx->mtl_x_norm, kv_dim, hidden);
     metal_sync();
 
-    /* Read back Q, K, V for CPU attention */
-    metal_buf_read(ctx->mtl_q, q_buf, num_heads * head_dim * sizeof(float));
-    metal_buf_read(ctx->mtl_k, k_buf, kv_dim * sizeof(float));
-    metal_buf_read(ctx->mtl_v, v_buf, kv_dim * sizeof(float));
+    /* Read Q, K, V directly from shared Metal buffers */
+    memcpy(q_buf, metal_buf_contents(ctx->mtl_q), num_heads * head_dim * sizeof(float));
+    memcpy(k_buf, metal_buf_contents(ctx->mtl_k), kv_dim * sizeof(float));
+    memcpy(v_buf, metal_buf_contents(ctx->mtl_v), kv_dim * sizeof(float));
 
     /* === Phase 2: CPU-side QK-Norm, M-RoPE, attention === */
     /* QK-Norm per head */
@@ -256,7 +256,7 @@ static void talker_attention_single_metal(
     }
 
     /* === Phase 3: GPU-accelerated output proj + MLP === */
-    metal_buf_write(ctx->mtl_attn_out, attn_out, num_heads * head_dim * sizeof(float));
+    memcpy(metal_buf_contents(ctx->mtl_attn_out), attn_out, num_heads * head_dim * sizeof(float));
 
     metal_begin();
     /* Output projection */
@@ -265,21 +265,16 @@ static void talker_attention_single_metal(
     metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, hidden);
     /* Post-attention norm */
     metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_post_attn_norm, hidden, eps);
-    /* Gate and Up projections */
-    metal_matvec_bf16(ctx->mtl_gate, layer->mtl_gate, ctx->mtl_x_norm, intermediate, hidden);
-    metal_matvec_bf16(ctx->mtl_up, layer->mtl_up, ctx->mtl_x_norm, intermediate, hidden);
-    /* SiLU(gate) */
-    metal_silu_inplace(ctx->mtl_gate, intermediate);
-    /* gate *= up */
-    metal_mul_inplace(ctx->mtl_gate, ctx->mtl_up, intermediate);
+    /* Fused SwiGLU: gate_out = silu(gate @ x) * (up @ x) in one dispatch */
+    metal_swiglu_matvec_bf16(ctx->mtl_gate, layer->mtl_gate_up_fused, ctx->mtl_x_norm, intermediate, hidden);
     /* Down projection */
     metal_matvec_bf16(ctx->mtl_x_norm, layer->mtl_down, ctx->mtl_gate, hidden, intermediate);
     /* Residual add */
     metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, hidden);
     metal_sync();
 
-    /* Read back x for next layer */
-    metal_buf_read(ctx->mtl_x, x, hidden * sizeof(float));
+    /* Read x directly from shared Metal buffer */
+    memcpy(x, metal_buf_contents(ctx->mtl_x), hidden * sizeof(float));
 }
 
 #endif /* USE_METAL */
@@ -301,13 +296,10 @@ static void talker_attention_single(
     const float *sin,
     int pos             /* current position in sequence */
 ) {
-#ifdef USE_METAL
-    if (metal_is_available()) {
-        talker_attention_single_metal(ctx, layer_idx, x, x_norm, q_buf, k_buf,
-                                      v_buf, attn_out, cos, sin, pos);
-        return;
-    }
-#endif
+    /* Note: Metal GPU path disabled for talker single-token path.
+     * Single-token matvecs (1024→2048) are too small to overcome Metal dispatch
+     * overhead — Apple's AMX coprocessor via Accelerate BLAS is faster.
+     * Metal is used for codec batch operations instead. */
     qwen_tts_config_t *cfg = &ctx->config;
     qwen_tts_talker_layer_t *layer = &ctx->talker.layers[layer_idx];
     int hidden = cfg->talker_hidden;
@@ -414,14 +406,10 @@ static void talker_attention_single(
     kernel_rms_norm(x_norm, x, layer->post_attn_norm, hidden, eps);
 
     float *gate_buf = ctx->tk_gate;
-    float *up_buf = ctx->tk_up;
 
-    kernel_matvec_bf16(gate_buf, layer->gate_bf16, x_norm, cfg->talker_intermediate, hidden);
-    kernel_matvec_bf16(up_buf, layer->up_bf16, x_norm, cfg->talker_intermediate, hidden);
-
-    /* SiLU(gate) * up */
-    kernel_silu_inplace(gate_buf, cfg->talker_intermediate);
-    kernel_mul_inplace(gate_buf, up_buf, cfg->talker_intermediate);
+    /* Fused SwiGLU: gate_out = silu(gate @ x) * (up @ x) in one pass */
+    kernel_swiglu_matvec_bf16(gate_buf, layer->gate_up_fused_bf16, x_norm,
+                              cfg->talker_intermediate, hidden);
 
     /* down projection */
     kernel_matvec_bf16(proj_out, layer->down_bf16, gate_buf, hidden, cfg->talker_intermediate);
@@ -706,24 +694,9 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
                                 ctx->tk_attn_out, cos_mrope, sin_mrope, pos);
     }
 
-    /* Final norm + codec head projection */
-#ifdef USE_METAL
-    if (metal_is_available()) {
-        /* x is already in mtl_x from the last layer's Metal path */
-        metal_buf_t mtl_logits = metal_buf_create_empty(cfg->talker_vocab_size * sizeof(float));
-        metal_begin();
-        metal_rms_norm_inplace(ctx->mtl_x, ctx->talker.mtl_norm, hidden, eps);
-        metal_matvec_bf16(mtl_logits, ctx->talker.mtl_codec_head, ctx->mtl_x, cfg->talker_vocab_size, hidden);
-        metal_sync();
-        metal_buf_read(ctx->mtl_x, x, hidden * sizeof(float));
-        metal_buf_read(mtl_logits, logits, cfg->talker_vocab_size * sizeof(float));
-        metal_buf_release(mtl_logits);
-    } else
-#endif
-    {
-        kernel_rms_norm_inplace(x, ctx->talker.norm, hidden, eps);
-        kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, x, cfg->talker_vocab_size, hidden);
-    }
+    /* Final norm + codec head projection (CPU — small ops, AMX is faster) */
+    kernel_rms_norm_inplace(x, ctx->talker.norm, hidden, eps);
+    kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, x, cfg->talker_vocab_size, hidden);
 
     ctx->talker_kv_len = pos + 1;
 }

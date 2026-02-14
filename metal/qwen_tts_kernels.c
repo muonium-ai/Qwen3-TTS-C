@@ -890,11 +890,7 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
 /* ======================================================================== */
 
 void kernel_init(void) {
-#ifdef USE_METAL
-    if (metal_init() == 0) {
-        metal_print_info();
-    } else {
-        fprintf(stderr, "Warning: Metal initialization failed, falling back to CPU\n");
-    }
-#endif
+    /* Metal GPU initialization is deferred to first use (lazy init).
+     * For the current model dimensions, CPU (Accelerate AMX) is faster
+     * than Metal for both single-token matvec and batch matmul. */
 }

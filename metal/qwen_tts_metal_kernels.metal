@@ -60,18 +60,24 @@ kernel void kernel_matvec_bf16_metal(
     if ((int)gid >= p.rows) return;
 
     int row = (int)gid;
-    const device ushort *a_row = A_bf16 + row * p.cols;
-    float sum = 0.0f;
+    const device ushort *a_row = A_bf16 + (long)row * p.cols;
+    const device float4 *x4 = (const device float4 *)x;
+    float4 acc = float4(0.0f);
 
-    /* Process 4 elements at a time for better throughput */
-    int c = 0;
-    for (; c + 3 < p.cols; c += 4) {
-        sum += bf16_to_f32(a_row[c])     * x[c];
-        sum += bf16_to_f32(a_row[c + 1]) * x[c + 1];
-        sum += bf16_to_f32(a_row[c + 2]) * x[c + 2];
-        sum += bf16_to_f32(a_row[c + 3]) * x[c + 3];
+    /* Process 4 elements at a time using float4 + dot() */
+    int c4 = p.cols / 4;
+    for (int i = 0; i < c4; i++) {
+        int base = i * 4;
+        float4 a4 = float4(bf16_to_f32(a_row[base]),
+                           bf16_to_f32(a_row[base + 1]),
+                           bf16_to_f32(a_row[base + 2]),
+                           bf16_to_f32(a_row[base + 3]));
+        acc += a4 * x4[i];
     }
-    for (; c < p.cols; c++) {
+    float sum = acc.x + acc.y + acc.z + acc.w;
+
+    /* Handle remainder */
+    for (int c = c4 * 4; c < p.cols; c++) {
         sum += bf16_to_f32(a_row[c]) * x[c];
     }
 
@@ -570,20 +576,38 @@ kernel void kernel_swiglu_matvec_bf16_metal(
     if ((int)gid >= p.intermediate) return;
 
     int i = (int)gid;
+    const device float4 *x4 = (const device float4 *)x;
+    int c4 = p.hidden / 4;
 
     /* Compute gate = gate_weights[i] @ x */
     const device ushort *gate_row = gate_up_bf16 + (long)i * p.hidden;
-    float gate_val = 0.0f;
-    for (int c = 0; c < p.hidden; c++) {
-        gate_val += bf16_to_f32(gate_row[c]) * x[c];
+    float4 gacc = float4(0.0f);
+    for (int j = 0; j < c4; j++) {
+        int base = j * 4;
+        float4 a4 = float4(bf16_to_f32(gate_row[base]),
+                           bf16_to_f32(gate_row[base + 1]),
+                           bf16_to_f32(gate_row[base + 2]),
+                           bf16_to_f32(gate_row[base + 3]));
+        gacc += a4 * x4[j];
     }
+    float gate_val = gacc.x + gacc.y + gacc.z + gacc.w;
+    for (int c = c4 * 4; c < p.hidden; c++)
+        gate_val += bf16_to_f32(gate_row[c]) * x[c];
 
     /* Compute up = up_weights[i] @ x */
     const device ushort *up_row = gate_up_bf16 + ((long)p.intermediate + i) * p.hidden;
-    float up_val = 0.0f;
-    for (int c = 0; c < p.hidden; c++) {
-        up_val += bf16_to_f32(up_row[c]) * x[c];
+    float4 uacc = float4(0.0f);
+    for (int j = 0; j < c4; j++) {
+        int base = j * 4;
+        float4 a4 = float4(bf16_to_f32(up_row[base]),
+                           bf16_to_f32(up_row[base + 1]),
+                           bf16_to_f32(up_row[base + 2]),
+                           bf16_to_f32(up_row[base + 3]));
+        uacc += a4 * x4[j];
     }
+    float up_val = uacc.x + uacc.y + uacc.z + uacc.w;
+    for (int c = c4 * 4; c < p.hidden; c++)
+        up_val += bf16_to_f32(up_row[c]) * x[c];
 
     /* SiLU(gate) * up */
     out[i] = (gate_val / (1.0f + exp(-gate_val))) * up_val;
