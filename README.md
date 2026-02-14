@@ -1,5 +1,28 @@
 # Qwen3-TTS
 
+## Qwen3-TTS-C Port (This Repo)
+
+If you are here for the native C implementation, start with `c/README.md`.
+
+What is implemented in this C port:
+
+- End-to-end two-stage inference pipeline (Talker + Sub-Talker + Codec Decoder/Vocoder)
+- SafeTensors loading for model and `speech_tokenizer` weights
+- Native CLI binary (`qwen-tts`) with speaker/language controls
+- Benchmark and regression tooling (`make benchmark`, EOS parity/regression checks)
+- Optimized CPU path (BLAS + OpenMP) and ongoing kernel-level tuning
+- Browser/WASM and WASI build targets (`make wasm`, `make wasm-wasi`, runtime smoke tests)
+- Browser demo UI with tokenizer integration and model-size preflight checks
+
+Why native C over Python runtime for production paths:
+
+- **Deployment simplicity**: single native binary without Python/PyTorch runtime
+- **Systems integration**: easier embedding in low-level services and constrained environments
+- **Performance control**: direct control over memory layout, kernels, threading, and allocation
+- **Portability roadmap**: cleaner path to native CPU + WASI/WASM + future GPU backends
+
+Current status: the C path has improved from early large gaps to near parity on normalized CPU metrics in this repo’s benchmark flow (latest snapshot in `TODO.md` shows ~`1.28x` vs Python on equal-work metrics).
+
 <br>
 
 <p align="center">
@@ -25,6 +48,7 @@ We release **Qwen3-TTS**, a series of powerful speech generation capabilities de
   - [Introduction](#introduction)
   - [Model Architecture](#model-architecture)
   - [Released Models Description and Download](#released-models-description-and-download)
+- [Qwen3-TTS-C Port (This Repo)](#qwen3-tts-c-port-this-repo)
 - [Quickstart](#quickstart)
   - [Environment Setup](#environment-setup)
   - [Python Package Usage](#python-package-usage)
