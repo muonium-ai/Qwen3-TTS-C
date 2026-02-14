@@ -65,6 +65,55 @@ make
 make debug
 ```
 
+### Browser WASM build (experimental)
+
+From repo root:
+
+```bash
+git submodule update --init --recursive
+make wasm-setup
+make wasm
+```
+
+This emits:
+
+- `dist/wasm/qwen-tts.js`
+- `dist/wasm/qwen-tts.wasm`
+- `dist/wasm/index.html`
+- `dist/wasm/app.js`
+
+Notes:
+
+- This path uses Emscripten (`emcc`) and currently targets CPU/WebAssembly kernels.
+- Emscripten is vendored as a submodule at `vendor/emsdk`.
+- `make wasm` auto-detects the vendored toolchain after `make wasm-setup`.
+- BLAS/OpenMP acceleration used on native builds is not available in this WASM build.
+- To run in browser, preload model files into Emscripten FS (MEMFS/IDBFS/WORKERFS) and call `Module.callMain([...])`.
+- Browser memory limits and Wasm32 address space may constrain full-size models.
+
+Quick start (from repo root):
+
+```bash
+python3 -m http.server 8000
+```
+
+Then open `http://localhost:8000/dist/wasm/`.
+
+The page supports:
+
+- Text input
+- Speaker/language selection (loaded from model `config.json`)
+- In-browser generation via WASM
+- Audio playback + WAV download
+
+#### WebGPU status
+
+WebGPU acceleration is possible, but not via this `make wasm` target alone.
+
+- Current target compiles existing CPU kernels to WASM.
+- To use WebGPU for speedups, hot kernels (matmul/conv/attention) must be ported to GPU compute (WGSL via WebGPU API), and runtime data movement/scheduling must be redesigned.
+- Practical next step: keep control flow in WASM and offload selected heavy kernels to a JS/WebGPU backend.
+
 ## Model Download
 
 Download the Qwen3-TTS model from HuggingFace:

@@ -16,6 +16,25 @@ SRCS = c/main.c c/qwen_tts.c c/qwen_tts_kernels.c c/qwen_tts_talker.c \
 
 # Output binary
 BIN = qwen-tts
+EMSDK_DIR ?= vendor/emsdk
+EMSDK_VERSION ?= latest
+EMSDK_EMCC ?= $(EMSDK_DIR)/upstream/emscripten/emcc
+EMCC ?= $(if $(wildcard $(EMSDK_EMCC)),$(EMSDK_EMCC),emcc)
+EMSDK_PYTHON ?= $(firstword $(wildcard $(EMSDK_DIR)/python/*_64bit/bin/python3) \
+	$(wildcard $(EMSDK_DIR)/python/*_64bit/bin/python3.*))
+EMSDK_ENV_VARS = EMSDK=$(abspath $(EMSDK_DIR)) EM_CONFIG=$(abspath $(EMSDK_DIR))/.emscripten \
+	EMSDK_PYTHON=$(EMSDK_PYTHON)
+WASM_OUT_DIR ?= dist/wasm
+WASM_BASENAME ?= qwen-tts
+WASM_MODEL_DIR ?= tmp/model
+WASM_JS := $(WASM_OUT_DIR)/$(WASM_BASENAME).js
+WASM_WASM := $(WASM_OUT_DIR)/$(WASM_BASENAME).wasm
+WASM_WEB_SRC_DIR ?= web/wasm
+WASM_WEB_FILES := $(WASM_WEB_SRC_DIR)/index.html $(WASM_WEB_SRC_DIR)/app.js
+WASM_COMMON_FLAGS = -O3 -DNDEBUG -s WASM=1 -s MODULARIZE=1 -s EXPORT_NAME=QwenTTSModule \
+	-s ENVIRONMENT=web,worker -s ALLOW_MEMORY_GROWTH=1 -s FORCE_FILESYSTEM=1 \
+	-s EXPORTED_FUNCTIONS='["_main","_malloc","_free"]' \
+	-s EXPORTED_RUNTIME_METHODS='["FS","callMain","ccall","cwrap"]'
 
 # Benchmark configuration (override in CI/environment)
 # Prefer python3.11 when available (commonly where torch is installed).
@@ -127,6 +146,50 @@ sanitize: CFLAGS += -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer
 sanitize: LDFLAGS += -fsanitize=address,undefined
 sanitize: $(BIN)
 
+.PHONY: wasm
+wasm: wasm-prepare-tokenizer
+	@command -v $(EMCC) >/dev/null 2>&1 || \
+		(echo "Error: emcc not found. Install and activate Emscripten SDK first."; \
+		 echo "This repo vendors emsdk as a submodule under $(EMSDK_DIR)."; \
+		 echo "Run: make wasm-setup"; \
+		 echo "Then: make wasm"; \
+		 exit 1)
+	@test -n "$(EMSDK_PYTHON)" || \
+		(echo "Error: vendored emsdk Python not found under $(EMSDK_DIR)/python."; \
+		 echo "Run: make wasm-setup"; exit 1)
+	@mkdir -p "$(WASM_OUT_DIR)"
+	$(EMSDK_ENV_VARS) $(EMCC) $(WASM_COMMON_FLAGS) -o "$(WASM_JS)" $(SRCS)
+	@for f in $(WASM_WEB_FILES); do cp "$$f" "$(WASM_OUT_DIR)/"; done
+	@echo "WASM build complete:"
+	@echo "  $(WASM_JS)"
+	@echo "  $(WASM_WASM)"
+	@echo "  $(WASM_OUT_DIR)/index.html"
+
+.PHONY: wasm-prepare-tokenizer
+wasm-prepare-tokenizer:
+	@if [ ! -d "$(WASM_MODEL_DIR)" ]; then \
+		echo "Skipping tokenizer prep: $(WASM_MODEL_DIR) not found"; \
+	elif [ -f "$(WASM_MODEL_DIR)/tokenizer.json" ]; then \
+		echo "Tokenizer already prepared: $(WASM_MODEL_DIR)/tokenizer.json"; \
+	else \
+		echo "Preparing tokenizer.json in $(WASM_MODEL_DIR)"; \
+		$(PYTHON) -c "from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('$(WASM_MODEL_DIR)', fix_mistral_regex=True); t.save_pretrained('$(WASM_MODEL_DIR)'); print('Generated tokenizer.json')" || { \
+			echo "Warning: failed to generate tokenizer.json automatically."; \
+			echo "Run manually after installing dependencies:"; \
+			echo "  $(PYTHON) -c \"from transformers import AutoTokenizer; t=AutoTokenizer.from_pretrained('$(WASM_MODEL_DIR)', fix_mistral_regex=True); t.save_pretrained('$(WASM_MODEL_DIR)')\""; \
+			exit 0; \
+		}; \
+	fi
+
+.PHONY: wasm-setup
+wasm-setup:
+	@test -d "$(EMSDK_DIR)" || \
+		(echo "Error: $(EMSDK_DIR) missing. Run: git submodule update --init --recursive"; exit 1)
+	cd "$(EMSDK_DIR)" && ./emsdk install "$(EMSDK_VERSION)" && ./emsdk activate "$(EMSDK_VERSION)"
+	@echo "Emscripten installed via $(EMSDK_DIR)"
+	@echo "You can now run:"
+	@echo "  make wasm"
+
 .PHONY: benchmark
 benchmark: all
 	@test -n "$(PYTHON_MODEL)" || (echo "Error: set PYTHON_MODEL or MODEL_DIR"; exit 1)
@@ -226,6 +289,7 @@ $(BIN): $(SRCS) c/qwen_tts.h c/qwen_tts_kernels.h c/qwen_tts_safetensors.h
 .PHONY: clean
 clean:
 	rm -f $(BIN)
+	rm -rf $(WASM_OUT_DIR)
 
 .PHONY: help
 help:
@@ -234,6 +298,9 @@ help:
 	@echo "Targets:"
 	@echo "  make          Build optimized binary (default)"
 	@echo "  make debug    Build with debug symbols + AddressSanitizer"
+	@echo "  make wasm     Build browser-loadable WASM artifacts (Emscripten required)"
+	@echo "  make wasm-prepare-tokenizer Ensure $(WASM_MODEL_DIR)/tokenizer.json for browser tokenizer"
+	@echo "  make wasm-setup Install/activate vendored emsdk toolchain ($(EMSDK_VERSION))"
 	@echo "  make setup-benchmark Install Python benchmark dependencies into $(PYTHON)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
 	@echo "  make benchmark-gate Run benchmark with normalized-metric quality gates (CI-friendly)"

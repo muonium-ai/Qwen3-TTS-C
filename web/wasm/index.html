@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Qwen3-TTS WASM Demo</title>
+  <style>
+    :root { font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, sans-serif; }
+    body { margin: 2rem auto; max-width: 900px; padding: 0 1rem; line-height: 1.4; }
+    h1 { margin: 0 0 1rem; font-size: 1.5rem; }
+    .grid { display: grid; gap: 0.75rem; }
+    .row { display: grid; gap: 0.5rem; grid-template-columns: 1fr 1fr; }
+    .row3 { display: grid; gap: 0.5rem; grid-template-columns: 1fr 1fr 1fr; }
+    label { font-size: 0.9rem; font-weight: 600; }
+    input, select, textarea, button {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 0.55rem 0.65rem;
+      border: 1px solid #c8c8c8;
+      border-radius: 8px;
+      font: inherit;
+    }
+    textarea { min-height: 110px; resize: vertical; }
+    button { cursor: pointer; font-weight: 600; }
+    .actions { display: grid; gap: 0.5rem; grid-template-columns: 1fr 1fr; }
+    .muted { color: #555; font-size: 0.9rem; }
+    #logs {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #111;
+      color: #c7f9cc;
+      padding: 0.75rem;
+      border-radius: 8px;
+      min-height: 140px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+  </style>
+</head>
+<body>
+  <h1>Qwen3-TTS WASM Browser Demo</h1>
+  <p class="muted">
+    Experimental CPU-WASM path. Large models may exceed browser memory limits.
+  </p>
+
+  <div class="grid">
+    <div class="row">
+      <div>
+        <label for="modelBase">Model Base URL</label>
+        <input id="modelBase" value="../../tmp/model" />
+      </div>
+      <div>
+        <label for="tokenizerBase">Tokenizer Base URL</label>
+        <input id="tokenizerBase" value="../../tmp/model" />
+      </div>
+    </div>
+
+    <div class="row3">
+      <div>
+        <label for="speaker">Speaker</label>
+        <select id="speaker"></select>
+      </div>
+      <div>
+        <label for="language">Language</label>
+        <select id="language"></select>
+      </div>
+      <div>
+        <label for="maxTokens">Max Tokens</label>
+        <input id="maxTokens" type="number" min="1" step="1" value="128" />
+      </div>
+    </div>
+
+    <div>
+      <label for="text">Text</label>
+      <textarea id="text">Hello from Qwen3-TTS running in WebAssembly.</textarea>
+    </div>
+
+    <div class="actions">
+      <button id="loadMetaBtn">Load Voices/Languages</button>
+      <button id="generateBtn">Generate Audio</button>
+    </div>
+
+    <audio id="audio" controls></audio>
+    <a id="download" download="qwen-tts.wav">Download WAV</a>
+
+    <div id="logs"></div>
+  </div>
+
+  <script src="./qwen-tts.js"></script>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
