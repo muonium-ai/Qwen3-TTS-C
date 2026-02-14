@@ -23,6 +23,7 @@ typedef struct {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLCommandBuffer> cmd_buf;
+    bool committed;
     int initialized;
 
     /* Buffer pool */
@@ -364,19 +365,24 @@ void metal_begin(void) {
             [g_metal.cmd_buf waitUntilCompleted];
         }
         g_metal.cmd_buf = [g_metal.queue commandBuffer];
+        g_metal.committed = false;
     }
 }
 
 void metal_commit(void) {
     if (!g_metal.initialized || !g_metal.cmd_buf) return;
     [g_metal.cmd_buf commit];
+    g_metal.committed = true;
 }
 
 void metal_sync(void) {
     if (!g_metal.initialized || !g_metal.cmd_buf) return;
-    [g_metal.cmd_buf commit];
+    if (!g_metal.committed) {
+        [g_metal.cmd_buf commit];
+    }
     [g_metal.cmd_buf waitUntilCompleted];
     g_metal.cmd_buf = nil;
+    g_metal.committed = false;
 }
 
 /* ========================================================================

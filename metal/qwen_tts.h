@@ -371,6 +371,12 @@ typedef struct {
     float *vocoder_final_act_beta;         /* [final_dim] */
     float *vocoder_final_conv_weight;      /* [1, final_dim, 7] */
     float *vocoder_final_conv_bias;        /* [1] */
+
+#ifdef USE_METAL
+    int mtl_input_proj_weight, mtl_input_proj_bias;
+    int mtl_output_proj_weight, mtl_output_proj_bias;
+    int mtl_transformer_norm;
+#endif
 } qwen_tts_codec_decoder_t;
 
 /* ========================================================================

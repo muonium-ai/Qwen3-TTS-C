@@ -828,6 +828,29 @@ static int ensure_codec_loaded(qwen_tts_ctx_t *ctx) {
             if (l->down) l->mtl_down = metal_buf_from_ptr(l->down, (size_t)codec_hidden * codec_intermediate * sizeof(float));
         }
 
+        /* Transformer input/output projections and norm */
+        int latent = ccfg->codec_latent;
+        if (ctx->codec.transformer_input_proj_weight)
+            ctx->codec.mtl_input_proj_weight = metal_buf_from_ptr(
+                ctx->codec.transformer_input_proj_weight,
+                (size_t)codec_hidden * latent * sizeof(float));
+        if (ctx->codec.transformer_input_proj_bias)
+            ctx->codec.mtl_input_proj_bias = metal_buf_create(
+                ctx->codec.transformer_input_proj_bias,
+                codec_hidden * sizeof(float));
+        if (ctx->codec.transformer_output_proj_weight)
+            ctx->codec.mtl_output_proj_weight = metal_buf_from_ptr(
+                ctx->codec.transformer_output_proj_weight,
+                (size_t)latent * codec_hidden * sizeof(float));
+        if (ctx->codec.transformer_output_proj_bias)
+            ctx->codec.mtl_output_proj_bias = metal_buf_create(
+                ctx->codec.transformer_output_proj_bias,
+                latent * sizeof(float));
+        if (ctx->codec.transformer_norm)
+            ctx->codec.mtl_transformer_norm = metal_buf_create(
+                ctx->codec.transformer_norm,
+                codec_hidden * sizeof(float));
+
         if (qwen_tts_verbose >= 1)
             fprintf(stderr, "Metal: uploaded codec weights\n");
     }

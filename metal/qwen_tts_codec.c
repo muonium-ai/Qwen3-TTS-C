@@ -264,8 +264,224 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
  * Codec Transformer (8 layers, sliding window attention, LayerScale)
  * ======================================================================== */
 
+#ifdef USE_METAL
+#include "qwen_tts_metal.h"
+
+static void codec_transformer_forward_metal(qwen_tts_ctx_t *ctx, float *hidden,
+                                             int seq_len) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int codec_hidden = cfg->codec_hidden;
+    int latent = cfg->codec_latent;
+    int layers = cfg->codec_layers;
+    int heads = cfg->codec_heads;
+    int kv_heads = cfg->codec_kv_heads;
+    int head_dim = codec_hidden / heads;
+    int kv_dim = kv_heads * head_dim;
+    int intermediate = cfg->codec_intermediate;
+    int sliding_window = cfg->codec_sliding_window;
+    int groups_per_head = heads / kv_heads;
+    float eps = cfg->codec_rms_norm_eps;
+
+    /* Create Metal scratch buffers for batch computation */
+    size_t x_size = (size_t)seq_len * codec_hidden * sizeof(float);
+    size_t q_size = (size_t)seq_len * heads * head_dim * sizeof(float);
+    size_t kv_size = (size_t)seq_len * kv_dim * sizeof(float);
+    size_t mlp_size = (size_t)seq_len * intermediate * sizeof(float);
+
+    metal_buf_t mtl_x = metal_buf_create_empty(x_size);
+    metal_buf_t mtl_xnorm = metal_buf_create_empty(x_size);
+    metal_buf_t mtl_q = metal_buf_create_empty(q_size);
+    metal_buf_t mtl_k = metal_buf_create_empty(kv_size);
+    metal_buf_t mtl_v = metal_buf_create_empty(kv_size);
+    metal_buf_t mtl_attn = metal_buf_create_empty(q_size);
+    metal_buf_t mtl_gate = metal_buf_create_empty(mlp_size);
+    metal_buf_t mtl_up = metal_buf_create_empty(mlp_size);
+    metal_buf_t mtl_hidden = metal_buf_create(hidden, (size_t)seq_len * latent * sizeof(float));
+
+    /* Input projection: [seq_len, latent] -> [seq_len, codec_hidden] via GPU matmul */
+    metal_begin();
+    metal_matmul_f32(mtl_x, mtl_hidden, ctx->codec.mtl_input_proj_weight,
+                     seq_len, codec_hidden, latent);
+    metal_commit();
+    metal_sync();
+
+    /* Add bias on CPU */
+    float *x = (float *)metal_buf_contents(mtl_x);
+    if (ctx->codec.transformer_input_proj_bias) {
+        for (int t = 0; t < seq_len; t++)
+            kernel_add_inplace(x + t * codec_hidden,
+                              ctx->codec.transformer_input_proj_bias, codec_hidden);
+    }
+
+    /* Compute RoPE cache on CPU */
+    float *rope_cos = (float *)malloc((size_t)seq_len * head_dim * sizeof(float));
+    float *rope_sin = (float *)malloc((size_t)seq_len * head_dim * sizeof(float));
+    {
+        int half = head_dim / 2;
+        float theta = 10000.0f;
+        for (int pos = 0; pos < seq_len; pos++) {
+            for (int i = 0; i < half; i++) {
+                float freq = 1.0f / powf(theta, (float)(2 * i) / (float)head_dim);
+                float angle = (float)pos * freq;
+                rope_cos[pos * head_dim + i] = cosf(angle);
+                rope_cos[pos * head_dim + i + half] = cosf(angle);
+                rope_sin[pos * head_dim + i] = sinf(angle);
+                rope_sin[pos * head_dim + i + half] = sinf(angle);
+            }
+        }
+    }
+
+    /* CPU scratch for attention */
+    float *attn_scores = (float *)malloc((size_t)seq_len * sizeof(float));
+
+    for (int layer = 0; layer < layers; layer++) {
+        qwen_tts_codec_transformer_layer_t *l = &ctx->codec.transformer_layers[layer];
+
+        /* RMSNorm per-timestep on CPU (writes into shared Metal buffer) */
+        float *x_norm = (float *)metal_buf_contents(mtl_xnorm);
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
+                           l->input_norm, codec_hidden, eps);
+
+        /* GPU: Q/K/V batch matmul */
+        metal_begin();
+        metal_matmul_f32(mtl_q, mtl_xnorm, l->mtl_wq, seq_len, heads * head_dim, codec_hidden);
+        metal_matmul_f32(mtl_k, mtl_xnorm, l->mtl_wk, seq_len, kv_dim, codec_hidden);
+        metal_matmul_f32(mtl_v, mtl_xnorm, l->mtl_wv, seq_len, kv_dim, codec_hidden);
+        metal_commit();
+        metal_sync();
+
+        /* Phase 2: CPU - RoPE + sliding-window attention */
+        float *q_all = (float *)metal_buf_contents(mtl_q);
+        float *k_all = (float *)metal_buf_contents(mtl_k);
+        float *v_all = (float *)metal_buf_contents(mtl_v);
+
+        /* RoPE */
+        for (int t = 0; t < seq_len; t++) {
+            kernel_rope_apply(q_all + t * heads * head_dim, NULL,
+                             rope_cos + t * head_dim, rope_sin + t * head_dim,
+                             heads, head_dim);
+            kernel_rope_apply(k_all + t * kv_dim, NULL,
+                             rope_cos + t * head_dim, rope_sin + t * head_dim,
+                             kv_heads, head_dim);
+        }
+
+        /* Sliding-window causal attention */
+        float scale = 1.0f / sqrtf((float)head_dim);
+        float *attn_out = (float *)metal_buf_contents(mtl_attn);
+        memset(attn_out, 0, (size_t)seq_len * heads * head_dim * sizeof(float));
+
+        for (int h = 0; h < heads; h++) {
+            int kv_h = h / groups_per_head;
+            for (int qi = 0; qi < seq_len; qi++) {
+                float *qh = q_all + qi * heads * head_dim + h * head_dim;
+                int start = qi - sliding_window + 1;
+                if (start < 0) start = 0;
+                int wlen = qi - start + 1;
+
+                for (int i = 0; i < wlen; i++) {
+                    int ki = start + i;
+                    float *kh = k_all + ki * kv_dim + kv_h * head_dim;
+                    attn_scores[i] = codec_dot(qh, kh, head_dim) * scale;
+                }
+                kernel_softmax(attn_scores, wlen);
+
+                float *oh = attn_out + qi * heads * head_dim + h * head_dim;
+                for (int i = 0; i < wlen; i++) {
+                    int ki = start + i;
+                    float *vh = v_all + ki * kv_dim + kv_h * head_dim;
+                    codec_axpy(head_dim, attn_scores[i], vh, oh);
+                }
+            }
+        }
+
+        /* Phase 3: GPU - Output projection + LayerScale + residual + MLP */
+        metal_begin();
+        metal_matmul_f32(mtl_xnorm, mtl_attn, l->mtl_wo, seq_len, codec_hidden, heads * head_dim);
+        metal_commit();
+        metal_sync();
+
+        /* LayerScale + residual (CPU - element-wise, fast) */
+        for (int t = 0; t < seq_len; t++) {
+            if (l->attn_layer_scale)
+                kernel_mul_inplace(x_norm + t * codec_hidden, l->attn_layer_scale, codec_hidden);
+            kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
+        }
+
+        /* Post-attn norm (CPU) */
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm(x_norm + t * codec_hidden, x + t * codec_hidden,
+                           l->post_attn_norm, codec_hidden, eps);
+
+        /* GPU: MLP gate/up/down */
+        metal_begin();
+        metal_matmul_f32(mtl_gate, mtl_xnorm, l->mtl_gate, seq_len, intermediate, codec_hidden);
+        metal_matmul_f32(mtl_up, mtl_xnorm, l->mtl_up, seq_len, intermediate, codec_hidden);
+        metal_commit();
+        metal_sync();
+
+        /* SiLU + mul (CPU - element-wise) */
+        float *gate_all = (float *)metal_buf_contents(mtl_gate);
+        float *up_all = (float *)metal_buf_contents(mtl_up);
+        for (int t = 0; t < seq_len; t++) {
+            float *g = gate_all + (size_t)t * intermediate;
+            float *u = up_all + (size_t)t * intermediate;
+            kernel_silu_inplace(g, intermediate);
+            kernel_mul_inplace(g, u, intermediate);
+        }
+
+        /* GPU: down projection */
+        metal_begin();
+        metal_matmul_f32(mtl_xnorm, mtl_gate, l->mtl_down, seq_len, codec_hidden, intermediate);
+        metal_commit();
+        metal_sync();
+
+        /* LayerScale + residual */
+        for (int t = 0; t < seq_len; t++) {
+            if (l->mlp_layer_scale)
+                kernel_mul_inplace(x_norm + t * codec_hidden, l->mlp_layer_scale, codec_hidden);
+            kernel_add_inplace(x + t * codec_hidden, x_norm + t * codec_hidden, codec_hidden);
+        }
+    }
+
+    /* Final norm */
+    if (ctx->codec.transformer_norm) {
+        for (int t = 0; t < seq_len; t++)
+            kernel_rms_norm_inplace(x + t * codec_hidden, ctx->codec.transformer_norm, codec_hidden, eps);
+    }
+
+    /* GPU: Output projection */
+    metal_begin();
+    metal_matmul_f32(mtl_hidden, mtl_x, ctx->codec.mtl_output_proj_weight,
+                     seq_len, latent, codec_hidden);
+    metal_commit();
+    metal_sync();
+
+    /* Copy result back + add bias */
+    memcpy(hidden, metal_buf_contents(mtl_hidden), (size_t)seq_len * latent * sizeof(float));
+    if (ctx->codec.transformer_output_proj_bias) {
+        for (int t = 0; t < seq_len; t++)
+            kernel_add_inplace(hidden + t * latent,
+                              ctx->codec.transformer_output_proj_bias, latent);
+    }
+
+    /* Cleanup */
+    free(rope_cos); free(rope_sin); free(attn_scores);
+    metal_buf_release(mtl_x); metal_buf_release(mtl_xnorm);
+    metal_buf_release(mtl_q); metal_buf_release(mtl_k); metal_buf_release(mtl_v);
+    metal_buf_release(mtl_attn); metal_buf_release(mtl_gate); metal_buf_release(mtl_up);
+    metal_buf_release(mtl_hidden);
+}
+#endif /* USE_METAL */
+
 static void codec_transformer_forward(qwen_tts_ctx_t *ctx, float *hidden,
                                         int seq_len) {
+#ifdef USE_METAL
+    if (metal_is_available()) {
+        codec_transformer_forward_metal(ctx, hidden, seq_len);
+        return;
+    }
+#endif
     qwen_tts_config_t *cfg = &ctx->config;
     int codec_hidden = cfg->codec_hidden;
     int latent = cfg->codec_latent;

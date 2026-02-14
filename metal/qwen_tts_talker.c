@@ -127,7 +127,9 @@ static void ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
     int kv_dim = kv_heads * head_dim;
     int intermediate = cfg->talker_intermediate;
 
-    if (ctx->mtl_x != METAL_BUF_INVALID) return;
+    static int scratch_init = 0;
+    if (scratch_init) return;
+    scratch_init = 1;
 
     ctx->mtl_x = metal_buf_create_empty(hidden * sizeof(float));
     ctx->mtl_x_norm = metal_buf_create_empty(hidden * sizeof(float));
