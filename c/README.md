@@ -82,6 +82,35 @@ This emits:
 - `dist/wasm/index.html`
 - `dist/wasm/app.js`
 
+### WASI runtime build (wasmtime/wasmer)
+
+```bash
+make wasm-wasi
+```
+
+This emits:
+
+- `dist/wasm/qwen-tts-wasi.wasm`
+
+Smoke-test both runtimes:
+
+```bash
+make wasm-runtime-smoke
+```
+
+Preflight-check browser model payload size:
+
+```bash
+make wasm-check-model
+```
+
+By default this enforces a `1400 MiB` budget (same guard used by the WASM UI).
+Override if needed:
+
+```bash
+make wasm-check-model WASM_MODEL_DIR=tmp/model WASM_MODEL_MAX_MIB=1200
+```
+
 Notes:
 
 - This path uses Emscripten (`emcc`) and currently targets CPU/WebAssembly kernels.
@@ -90,6 +119,8 @@ Notes:
 - BLAS/OpenMP acceleration used on native builds is not available in this WASM build.
 - To run in browser, preload model files into Emscripten FS (MEMFS/IDBFS/WORKERFS) and call `Module.callMain([...])`.
 - Browser memory limits and Wasm32 address space may constrain full-size models.
+- If UI logs show `Tokenized 1 prompt tokens`, tokenizer output is invalid for this pipeline and generation will fail.
+- Full-size `Qwen/Qwen3-TTS` weights are typically too large for browser Wasm32 memory limits; use smaller/quantized models for browser experiments.
 
 Quick start (from repo root):
 

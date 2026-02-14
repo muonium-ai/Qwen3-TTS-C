@@ -1,7 +1,9 @@
 let modulePromise = null;
 let tokenizerPromise = null;
 let loadedModelBase = null;
+let loadedModelBytes = 0;
 let audioUrl = null;
+const WASM_MODEL_BYTES_LIMIT = 1400 * 1024 * 1024;
 
 const el = {
   modelBase: document.getElementById("modelBase"),
@@ -186,7 +188,9 @@ async function discoverModelFiles(modelBase) {
 }
 
 async function preloadModelToFS(module, modelBase) {
-  if (loadedModelBase === modelBase) return;
+  if (loadedModelBase === modelBase) {
+    return { totalBytes: loadedModelBytes };
+  }
 
   const { FS } = module;
   ensureDir(FS, "/model");
@@ -194,6 +198,7 @@ async function preloadModelToFS(module, modelBase) {
 
   const files = await discoverModelFiles(modelBase);
   log(`Discovered ${files.length} model files to preload`);
+  let totalBytes = 0;
 
   for (let i = 0; i < files.length; i++) {
     const rel = files[i];
@@ -201,11 +206,15 @@ async function preloadModelToFS(module, modelBase) {
     const dst = `/model/${rel}`;
     log(`[${i + 1}/${files.length}] downloading ${rel}`);
     const bytes = await fetchBinary(src);
+    totalBytes += bytes.byteLength;
     FS.writeFile(dst, bytes);
   }
 
   loadedModelBase = modelBase;
+  loadedModelBytes = totalBytes;
+  log(`Preloaded ${(totalBytes / (1024 * 1024)).toFixed(1)} MiB into WASM FS`);
   log("Model files loaded into WASM FS");
+  return { totalBytes };
 }
 
 async function loadSpeakersAndLanguages(modelBase) {
@@ -262,9 +271,27 @@ async function tokenizePrompt(text, tokenizerBase) {
   const tokenizer = await getTokenizer(tokenizerBase);
   const chat = `<|im_start|>assistant\n${text}<|im_end|>\n<|im_start|>assistant\n`;
   const encoded = await tokenizer(chat, { add_special_tokens: false });
-  const raw = Array.isArray(encoded.input_ids?.[0]) ? encoded.input_ids[0] : encoded.input_ids;
-  if (!raw) throw new Error("Tokenizer returned no input_ids");
-  return Array.from(raw, (v) => Number(v));
+  const inputIds = encoded?.input_ids;
+  if (!inputIds) throw new Error("Tokenizer returned no input_ids");
+
+  let raw = null;
+  if (Array.isArray(inputIds)) {
+    raw = Array.isArray(inputIds[0]) ? inputIds[0] : inputIds;
+  } else if (inputIds.data && typeof inputIds.data.length === "number") {
+    raw = inputIds.data;
+  } else if (typeof inputIds.tolist === "function") {
+    const listed = inputIds.tolist();
+    raw = Array.isArray(listed[0]) ? listed[0] : listed;
+  }
+  if (!raw || typeof raw.length !== "number") {
+    throw new Error("Unsupported tokenizer output format for input_ids");
+  }
+
+  const ids = Array.from(raw, (v) => Number(v));
+  if (!ids.length || ids.some((v) => !Number.isFinite(v))) {
+    throw new Error("Tokenizer produced invalid token IDs");
+  }
+  return ids;
 }
 
 async function generate() {
@@ -296,10 +323,20 @@ async function generate() {
   if (!text) throw new Error("Please enter text");
 
   const module = await getModule();
-  await preloadModelToFS(module, modelBase);
+  const preload = await preloadModelToFS(module, modelBase);
+  if (preload.totalBytes > WASM_MODEL_BYTES_LIMIT) {
+    throw new Error(
+      `Model payload ${(preload.totalBytes / (1024 * 1024)).toFixed(1)} MiB exceeds browser WASM budget (~${(WASM_MODEL_BYTES_LIMIT / (1024 * 1024)).toFixed(0)} MiB). Use a smaller/quantized model.`,
+    );
+  }
 
   log("Tokenizing input text...");
   const tokenIds = await tokenizePrompt(text, tokenizerBase);
+  if (tokenIds.length < 8) {
+    throw new Error(
+      `Tokenizer produced too few tokens (${tokenIds.length}). Check tokenizer/model path and try again.`,
+    );
+  }
   log(`Tokenized ${tokenIds.length} prompt tokens`);
 
   const outPath = "/tmp/output.wav";
@@ -326,6 +363,12 @@ async function generate() {
   try {
     module.FS.stat(outPath);
   } catch (_) {
+    const logs = el.logs.textContent || "";
+    if (logs.includes("speech_tokenizer weights are required in WASM build")) {
+      throw new Error(
+        "WASM run stopped: speech_tokenizer/model.safetensors could not be opened in browser memory. Use a smaller/quantized model for browser runs.",
+      );
+    }
     throw new Error(
       "Inference failed before WAV output. Check logs above (often missing speech_tokenizer weights or browser memory limits).",
     );

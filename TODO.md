@@ -28,3 +28,11 @@ Latest profile snapshot (2026-02-13, `./qwen-tts -v -v`, deterministic decode):
 - Talker decode: ~11.2s for 74 tokens (~151 ms/token).
 - Codec total: ~4.16s, dominated by vocoder (~3.90s).
 - `make benchmark-gate` (equal_token_budget=128): C/Python ratio improved to ~1.28x on `ms/token` and `ms/audio_sec`.
+
+## P3 - Browser/WASM execution
+
+- [ ] Add an int8/int4 quantized model path suitable for browser memory constraints (target payload < 1.4 GiB total).
+- [ ] Implement shard-wise/streamed model loading in browser to avoid loading all large files into MEMFS at once.
+- [ ] Add a browser E2E smoke test with a tiny fixture model (CI-friendly, verifies tokenization + inference + WAV output).
+- [ ] Prototype WebGPU kernels for top hotspots (matmul, causal conv1d, transposed conv1d) with JS/WGSL backend.
+- [ ] Add runtime capability detection and fallback policy (`WebGPU -> WASM -> fail with actionable message`).

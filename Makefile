@@ -29,12 +29,18 @@ WASM_BASENAME ?= qwen-tts
 WASM_MODEL_DIR ?= tmp/model
 WASM_JS := $(WASM_OUT_DIR)/$(WASM_BASENAME).js
 WASM_WASM := $(WASM_OUT_DIR)/$(WASM_BASENAME).wasm
+WASM_WASI_BASENAME ?= qwen-tts-wasi
+WASM_WASI := $(WASM_OUT_DIR)/$(WASM_WASI_BASENAME).wasm
+WASM_BUILD_ID ?= $(shell date +%s)
 WASM_WEB_SRC_DIR ?= web/wasm
 WASM_WEB_FILES := $(WASM_WEB_SRC_DIR)/index.html $(WASM_WEB_SRC_DIR)/app.js
+WASM_MODEL_MAX_MIB ?= 1400
 WASM_COMMON_FLAGS = -O3 -DNDEBUG -s WASM=1 -s MODULARIZE=1 -s EXPORT_NAME=QwenTTSModule \
 	-s ENVIRONMENT=web,worker -s ALLOW_MEMORY_GROWTH=1 -s FORCE_FILESYSTEM=1 \
 	-s EXPORTED_FUNCTIONS='["_main","_malloc","_free"]' \
 	-s EXPORTED_RUNTIME_METHODS='["FS","callMain","ccall","cwrap"]'
+WASM_WASI_FLAGS = -O3 -DNDEBUG -s STANDALONE_WASM=1 -s PURE_WASI=1 -s WASMFS=1 \
+	-s INITIAL_MEMORY=268435456
 
 # Benchmark configuration (override in CI/environment)
 # Prefer python3.11 when available (commonly where torch is installed).
@@ -160,10 +166,42 @@ wasm: wasm-prepare-tokenizer
 	@mkdir -p "$(WASM_OUT_DIR)"
 	$(EMSDK_ENV_VARS) $(EMCC) $(WASM_COMMON_FLAGS) -o "$(WASM_JS)" $(SRCS)
 	@for f in $(WASM_WEB_FILES); do cp "$$f" "$(WASM_OUT_DIR)/"; done
+	@perl -0pi -e 's/__WASM_BUILD_ID__/$(WASM_BUILD_ID)/g' "$(WASM_OUT_DIR)/index.html"
 	@echo "WASM build complete:"
 	@echo "  $(WASM_JS)"
 	@echo "  $(WASM_WASM)"
 	@echo "  $(WASM_OUT_DIR)/index.html"
+
+.PHONY: wasm-wasi
+wasm-wasi:
+	@command -v $(EMCC) >/dev/null 2>&1 || \
+		(echo "Error: emcc not found. Run: make wasm-setup"; exit 1)
+	@test -n "$(EMSDK_PYTHON)" || \
+		(echo "Error: vendored emsdk Python not found under $(EMSDK_DIR)/python."; \
+		 echo "Run: make wasm-setup"; exit 1)
+	@mkdir -p "$(WASM_OUT_DIR)"
+	$(EMSDK_ENV_VARS) $(EMCC) $(WASM_WASI_FLAGS) -o "$(WASM_WASI)" $(SRCS)
+	@echo "WASI wasm build complete: $(WASM_WASI)"
+
+.PHONY: wasm-runtime-smoke
+wasm-runtime-smoke: wasm-wasi
+	@command -v wasmtime >/dev/null 2>&1 || (echo "Error: wasmtime not found"; exit 1)
+	@command -v wasmer >/dev/null 2>&1 || (echo "Error: wasmer not found"; exit 1)
+	@out="$$(wasmtime run $(WASM_WASI) 2>&1 || true)"; \
+		echo "$$out"; \
+		echo "$$out" | rg -q "model directory required"
+	@out="$$(wasmer run $(WASM_WASI) 2>&1 || true)"; \
+		echo "$$out"; \
+		echo "$$out" | rg -q "model directory required"
+	@echo "WASM runtime smoke test passed for wasmtime + wasmer"
+
+.PHONY: wasm-check-model
+wasm-check-model:
+	@test -d "$(WASM_MODEL_DIR)" || \
+		(echo "Error: model directory not found: $(WASM_MODEL_DIR)"; exit 1)
+	@$(PYTHON) scripts/wasm_check_model.py \
+		--model-dir "$(WASM_MODEL_DIR)" \
+		--max-mib "$(WASM_MODEL_MAX_MIB)"
 
 .PHONY: wasm-prepare-tokenizer
 wasm-prepare-tokenizer:

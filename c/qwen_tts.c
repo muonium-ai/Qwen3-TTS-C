@@ -18,6 +18,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#ifdef __EMSCRIPTEN__
+#include <dirent.h>
+#include <unistd.h>
+#endif
 
 int qwen_tts_verbose = 0;
 
@@ -754,6 +758,52 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
     if (qwen_tts_verbose >= 1) fprintf(stderr, "  Codec decoder loaded\n");
 }
 
+static int ensure_codec_loaded(qwen_tts_ctx_t *ctx) {
+    if (!ctx) return -1;
+    if (ctx->codec_safetensors) return 0;
+
+#ifdef __EMSCRIPTEN__
+    /* In browser/WASM, keep peak memory lower by dropping talker mapping first. */
+    if (ctx->safetensors) {
+        if (qwen_tts_verbose >= 1) {
+            fprintf(stderr, "WASM: releasing talker safetensors before codec load\n");
+        }
+        multi_safetensors_close((multi_safetensors_t *)ctx->safetensors);
+        ctx->safetensors = NULL;
+    }
+
+    /* Free large root talker safetensors files from MEMFS before codec load. */
+    DIR *d = opendir(ctx->model_dir);
+    if (d) {
+        struct dirent *ent;
+        while ((ent = readdir(d)) != NULL) {
+            const char *name = ent->d_name;
+            const char *ext = strrchr(name, '.');
+            int remove_file = 0;
+            if (ext && strcmp(ext, ".safetensors") == 0) remove_file = 1;
+            if (strstr(name, ".safetensors.index.json")) remove_file = 1;
+            if (remove_file) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/%s", ctx->model_dir, name);
+                unlink(path);
+            }
+        }
+        closedir(d);
+    }
+#endif
+
+    char codec_dir[1024];
+    snprintf(codec_dir, sizeof(codec_dir), "%s/speech_tokenizer", ctx->model_dir);
+    multi_safetensors_t *cms = multi_safetensors_open(codec_dir);
+    if (!cms) {
+        fprintf(stderr, "Error: cannot open speech_tokenizer safetensors in %s\n", codec_dir);
+        return -1;
+    }
+    ctx->codec_safetensors = cms;
+    load_codec_weights(ctx, cms);
+    return 0;
+}
+
 /* ========================================================================
  * Text projection helper
  *
@@ -839,16 +889,15 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     load_subtalker_weights(ctx, ms);
 
     /* Open codec decoder safetensors */
-    char codec_dir[1024];
-    snprintf(codec_dir, sizeof(codec_dir), "%s/speech_tokenizer", model_dir);
-    multi_safetensors_t *cms = multi_safetensors_open(codec_dir);
-    if (!cms) {
-        fprintf(stderr, "Error: cannot open speech_tokenizer safetensors in %s\n", codec_dir);
-        /* Continue without codec (can still generate tokens) */
-    } else {
-        ctx->codec_safetensors = cms;
-        load_codec_weights(ctx, cms);
+#ifndef __EMSCRIPTEN__
+    if (ensure_codec_loaded(ctx) != 0) {
+        /* Continue without codec (can still generate tokens). */
     }
+#else
+    if (qwen_tts_verbose >= 1) {
+        fprintf(stderr, "WASM: deferring codec decoder load until decode stage\n");
+    }
+#endif
 
     kernel_init();
 
@@ -1002,6 +1051,11 @@ float *qwen_tts_generate(
     const char *language,
     int *out_samples
 ) {
+    if (!ctx || !out_samples) {
+        return NULL;
+    }
+    *out_samples = 0;
+
     /* For now, we require pre-tokenized IDs stored in ctx.
      * This function implements the full generate flow with hardcoded token IDs.
      *
@@ -1022,10 +1076,19 @@ float *qwen_tts_generate(
 
         text_tokens = (int *)malloc(count * sizeof(int));
         p = text;
-        while (*p) {
+        while (*p && n_text_tokens < count) {
             while (*p == ' ' || *p == ',') p++;
             if (*p == '\0') break;
-            text_tokens[n_text_tokens++] = (int)strtol(p, (char **)&p, 10);
+            char *endp = NULL;
+            long v = strtol(p, &endp, 10);
+            if (endp == p) {
+                fprintf(stderr, "Error: invalid token ID near '%s'\n", p);
+                free(text_tokens);
+                *out_samples = 0;
+                return NULL;
+            }
+            text_tokens[n_text_tokens++] = (int)v;
+            p = endp;
         }
     }
 
@@ -1323,7 +1386,7 @@ float *qwen_tts_generate(
         return NULL;
     }
 
-    if (!ctx->codec_safetensors) {
+    if (ensure_codec_loaded(ctx) != 0) {
         fprintf(stderr,
                 "Error: codec decoder weights are unavailable (missing /model/speech_tokenizer/*.safetensors)\n");
         free(all_codes); free(next_embed);

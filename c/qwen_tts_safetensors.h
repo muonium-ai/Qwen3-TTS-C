@@ -23,6 +23,7 @@ typedef struct {
     char *path;
     int fd;
     void *mmap_addr;
+    int is_heap_copy;       /* 1 when file data is loaded into malloc buffer */
     size_t mmap_size;
     size_t header_size;     /* JSON header byte count */
     uint8_t *data_start;    /* pointer to start of tensor data */

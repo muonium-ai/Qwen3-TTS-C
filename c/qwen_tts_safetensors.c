@@ -164,16 +164,45 @@ static safetensors_file_t *safetensors_open(const char *path) {
     if (fstat(fd, &st) < 0) { close(fd); return NULL; }
     size_t file_size = (size_t)st.st_size;
 
-    void *addr = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (addr == MAP_FAILED) { close(fd); return NULL; }
+    void *addr = NULL;
+    int is_heap_copy = 0;
+
+    addr = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (addr == MAP_FAILED) {
+#ifdef __EMSCRIPTEN__
+        /* Some browser FS backends can fail mmap for large files. Fall back to heap copy. */
+        addr = malloc(file_size);
+        if (!addr) {
+            close(fd);
+            return NULL;
+        }
+        size_t off = 0;
+        while (off < file_size) {
+            ssize_t n = read(fd, (uint8_t *)addr + off, file_size - off);
+            if (n <= 0) {
+                free(addr);
+                close(fd);
+                return NULL;
+            }
+            off += (size_t)n;
+        }
+        close(fd);
+        fd = -1;
+        is_heap_copy = 1;
+#else
+        close(fd);
+        return NULL;
+#endif
+    }
 
     /* Read header size (8 bytes LE) */
     uint64_t header_size;
     memcpy(&header_size, addr, 8);
 
     if (header_size + 8 > file_size) {
-        munmap(addr, file_size);
-        close(fd);
+        if (is_heap_copy) free(addr);
+        else munmap(addr, file_size);
+        if (fd >= 0) close(fd);
         return NULL;
     }
 
@@ -227,6 +256,7 @@ static safetensors_file_t *safetensors_open(const char *path) {
     sf->path = strdup(path);
     sf->fd = fd;
     sf->mmap_addr = addr;
+    sf->is_heap_copy = is_heap_copy;
     sf->mmap_size = file_size;
     sf->header_size = (size_t)header_size;
     sf->data_start = (uint8_t *)addr + 8 + header_size;
@@ -243,7 +273,9 @@ static void safetensors_close(safetensors_file_t *sf) {
         free(sf->tensors[i].dtype);
     }
     free(sf->tensors);
-    if (sf->mmap_addr && sf->mmap_addr != MAP_FAILED) {
+    if (sf->is_heap_copy) {
+        free(sf->mmap_addr);
+    } else if (sf->mmap_addr && sf->mmap_addr != MAP_FAILED) {
         munmap(sf->mmap_addr, sf->mmap_size);
     }
     if (sf->fd >= 0) close(sf->fd);
