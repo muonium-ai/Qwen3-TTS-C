@@ -76,6 +76,22 @@ static float *bf16_scratch_get(size_t n) {
 }
 #endif
 
+/* Persistent scratch for packed conv1d weights: [kernel, out_channels, in_channels]. */
+#ifdef USE_BLAS
+static float *_conv1d_wpack = NULL;
+static size_t _conv1d_wpack_cap = 0;
+
+static float *conv1d_wpack_get(size_t n) {
+    if (n > _conv1d_wpack_cap) {
+        float *tmp = (float *)realloc(_conv1d_wpack, n * sizeof(float));
+        if (!tmp) return NULL;
+        _conv1d_wpack = tmp;
+        _conv1d_wpack_cap = n;
+    }
+    return _conv1d_wpack;
+}
+#endif
+
 void kernel_matvec_bf16(float *out, const uint16_t *A_bf16, const float *x, int rows, int cols) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
     /* Fused BF16→F32 + dot product using NEON — no intermediate buffer needed */
@@ -611,6 +627,65 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
     int pad = eff_kernel - 1; /* causal: all padding on left */
     int ch_per_group = in_channels / groups;
     int out_per_group = out_channels / groups;
+
+#ifdef USE_BLAS
+    /*
+     * BLAS fast path for groups=1 and kernel>1.
+     * Pack weights into [k, out, in] contiguous blocks and run one GEMM per tap.
+     * This is especially beneficial for large vocoder k=7 convolutions.
+     */
+    if (groups == 1 && kernel_size > 1) {
+        size_t pack_elems = (size_t)kernel_size * out_channels * in_channels;
+        float *wpack = conv1d_wpack_get(pack_elems);
+        if (wpack) {
+            for (int k = 0; k < kernel_size; k++) {
+                float *wk = wpack + (size_t)k * out_channels * in_channels;
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const float *src = weight + (size_t)oc * in_channels * kernel_size + k;
+                    float *dst = wk + (size_t)oc * in_channels;
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        dst[ic] = src[(size_t)ic * kernel_size];
+                    }
+                }
+            }
+
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * length;
+                float b = bias ? bias[oc] : 0.0f;
+                for (int t = 0; t < length; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                int shift = pad - k * dilation;
+                int out_start = shift;
+                int in_start = 0;
+                if (out_start < 0) {
+                    in_start = -out_start;
+                    out_start = 0;
+                }
+                if (out_start >= length || in_start >= length) continue;
+
+                int n = length - out_start;
+                int n_in = length - in_start;
+                if (n > n_in) n = n_in;
+                if (n <= 0) continue;
+
+                const float *wk = wpack + (size_t)k * out_channels * in_channels;
+                const float *in_blk = input + in_start;
+                float *out_blk = out + out_start;
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            out_channels, n, in_channels,
+                            1.0f, wk, in_channels,
+                            in_blk, length,
+                            1.0f, out_blk, length);
+            }
+            return;
+        }
+    }
+#endif
 
     /* Fast path for pointwise conv: k=1, dilation=1 (very common in vocoder). */
     if (kernel_size == 1 && dilation == 1) {

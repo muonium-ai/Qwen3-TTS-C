@@ -22,7 +22,9 @@
 - [x] Reduce per-step allocator/memory traffic in generation loops.
 - [x] Investigate codec decoder kernel fusion opportunities after talker parity is stable.
   First pass done: in-place SnakeBeta fusion in vocoder blocks/resunits/final stage to remove extra activation buffers.
+  Second pass done: BLAS-packed `groups=1, kernel>1` causal-conv path (per-tap GEMM) for heavy vocoder convs.
 
 Latest profile snapshot (2026-02-13, `./qwen-tts -v -v`, deterministic decode):
 - Talker decode: ~11.2s for 74 tokens (~151 ms/token).
 - Codec total: ~4.16s, dominated by vocoder (~3.90s).
+- `make benchmark-gate` (equal_token_budget=128): C/Python ratio improved to ~1.28x on `ms/token` and `ms/audio_sec`.
