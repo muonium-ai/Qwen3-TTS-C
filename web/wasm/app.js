@@ -316,7 +316,20 @@ async function generate() {
   ];
 
   log("Running WASM inference...");
-  module.callMain(args);
+  try {
+    module.callMain(args);
+  } catch (err) {
+    const msg = String(err && err.message ? err.message : err);
+    if (!msg.includes("ExitStatus")) throw err;
+  }
+
+  try {
+    module.FS.stat(outPath);
+  } catch (_) {
+    throw new Error(
+      "Inference failed before WAV output. Check logs above (often missing speech_tokenizer weights or browser memory limits).",
+    );
+  }
 
   const wav = module.FS.readFile(outPath, { encoding: "binary" });
   const blob = new Blob([wav], { type: "audio/wav" });

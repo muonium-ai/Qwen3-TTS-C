@@ -1323,10 +1323,23 @@ float *qwen_tts_generate(
         return NULL;
     }
 
+    if (!ctx->codec_safetensors) {
+        fprintf(stderr,
+                "Error: codec decoder weights are unavailable (missing /model/speech_tokenizer/*.safetensors)\n");
+        free(all_codes); free(next_embed);
+        *out_samples = 0;
+        return NULL;
+    }
+
     /* ---- Codec Decode ---- */
     double t_codec = time_ms();
 
     float *audio = qwen_tts_codec_decode(ctx, all_codes, n_generated, out_samples);
+    if (!audio || *out_samples <= 0) {
+        free(all_codes); free(next_embed);
+        *out_samples = 0;
+        return NULL;
+    }
 
     double t_codec_done = time_ms();
     ctx->perf_codec_ms = t_codec_done - t_codec;

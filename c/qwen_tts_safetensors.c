@@ -320,6 +320,13 @@ multi_safetensors_t *multi_safetensors_open(const char *dir) {
         fprintf(stderr, "Loaded %d safetensors files (%d tensors total)\n", ms->n_files, total);
     }
 
+    if (ms->n_files == 0) {
+        fprintf(stderr, "multi_safetensors_open: failed to open any safetensors files in %s\n", dir);
+        free(ms->files);
+        free(ms);
+        return NULL;
+    }
+
     return ms;
 }
 

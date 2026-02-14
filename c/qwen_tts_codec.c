@@ -28,6 +28,64 @@ static double now_ms(void) {
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
 
+static int codec_decoder_weights_ready(const qwen_tts_ctx_t *ctx) {
+    const qwen_tts_config_t *cfg = &ctx->config;
+    const qwen_tts_codec_decoder_t *codec = &ctx->codec;
+
+    if (!codec->rvq.semantic_codebooks[0].cluster_usage ||
+        !codec->rvq.semantic_codebooks[0].embedding_sum ||
+        !codec->rvq.semantic_output_proj ||
+        !codec->rvq.acoustic_output_proj ||
+        !codec->pre_conv_weight ||
+        !codec->transformer_input_proj_weight ||
+        !codec->transformer_output_proj_weight ||
+        !codec->vocoder_pre_conv_weight ||
+        !codec->vocoder_final_conv_weight) {
+        return 0;
+    }
+
+    for (int q = 0; q < cfg->codec_num_quantizers - 1; q++) {
+        if (!codec->rvq.acoustic_codebooks[q].cluster_usage ||
+            !codec->rvq.acoustic_codebooks[q].embedding_sum) {
+            return 0;
+        }
+    }
+
+    for (int i = 0; i < cfg->codec_layers; i++) {
+        const qwen_tts_codec_transformer_layer_t *l = &codec->transformer_layers[i];
+        if (!l->input_norm || !l->post_attn_norm || !l->wq || !l->wk ||
+            !l->wv || !l->wo || !l->gate || !l->up || !l->down) {
+            return 0;
+        }
+    }
+
+    for (int s = 0; s < 2; s++) {
+        const qwen_tts_convnext_block_t *cn = &codec->upsample_convnext[s];
+        if (!codec->upsample_transconv_weight[s] || !codec->upsample_transconv_bias[s] ||
+            !cn->dwconv_weight || !cn->norm_weight || !cn->norm_bias ||
+            !cn->pwconv1_weight || !cn->pwconv1_bias ||
+            !cn->pwconv2_weight || !cn->pwconv2_bias || !cn->gamma) {
+            return 0;
+        }
+    }
+
+    for (int b = 0; b < 4; b++) {
+        const qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
+        if (!vb->act_alpha || !vb->act_beta || !vb->transconv_weight || !vb->transconv_bias) {
+            return 0;
+        }
+        for (int r = 0; r < 3; r++) {
+            const qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+            if (!ru->act1_alpha || !ru->act1_beta || !ru->conv1_weight || !ru->conv1_bias ||
+                !ru->act2_alpha || !ru->act2_beta || !ru->conv2_weight || !ru->conv2_bias) {
+                return 0;
+            }
+        }
+    }
+
+    return 1;
+}
+
 static inline float codec_dot(const float *a, const float *b, int n) {
 #ifdef USE_BLAS
     return cblas_sdot(n, a, 1, b, 1);
@@ -131,6 +189,12 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
             }
         }
     } else {
+        if (half_latent != vq_dim) {
+            fprintf(stderr, "Error: missing semantic output projection for RVQ dequantization\n");
+            free(semantic_sum); free(acoustic_sum);
+            free(semantic_out);
+            return NULL;
+        }
         memcpy(semantic_out, semantic_sum, (size_t)half_latent * time_steps * sizeof(float));
     }
 
@@ -175,6 +239,12 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
             }
         }
     } else {
+        if (half_latent != vq_dim) {
+            fprintf(stderr, "Error: missing acoustic output projection for RVQ dequantization\n");
+            free(semantic_sum); free(acoustic_sum);
+            free(semantic_out); free(acoustic_out);
+            return NULL;
+        }
         memcpy(acoustic_out, acoustic_sum, (size_t)half_latent * time_steps * sizeof(float));
     }
 
@@ -510,6 +580,16 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
 
 float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
                               int time_steps, int *out_samples) {
+    if (!ctx || !codes || !out_samples || time_steps <= 0) {
+        if (out_samples) *out_samples = 0;
+        return NULL;
+    }
+    if (!codec_decoder_weights_ready(ctx)) {
+        fprintf(stderr, "Error: codec decoder is not fully loaded; cannot decode audio\n");
+        *out_samples = 0;
+        return NULL;
+    }
+
     qwen_tts_config_t *cfg = &ctx->config;
     int num_quantizers = cfg->codec_num_quantizers;
     int latent_dim = cfg->codec_latent;
@@ -527,6 +607,10 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
 
     /* 1. RVQ Dequantize → [codebook_dim, time_steps] */
     float *hidden = codec_rvq_dequantize(ctx, codes, time_steps, num_quantizers);
+    if (!hidden) {
+        *out_samples = 0;
+        return NULL;
+    }
     stage_rvq_ms = now_ms() - stage_t0;
 
     /* 2. Pre-conv: CausalConv1d(codebook_dim=512, latent_dim=1024, k=3) */
