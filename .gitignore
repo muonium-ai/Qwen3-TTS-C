@@ -28,6 +28,12 @@ qwen-tts
 *.o
 *.dSYM/
 
+# Metal build artifacts
+metal/qwen-tts-metal
+metal/qwen-tts-cpu
+metal/*.metallib
+metal/*.air
+
 # Model weights (too large for git)
 model/
 
