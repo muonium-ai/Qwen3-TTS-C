@@ -144,6 +144,7 @@ static int ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
     int head_dim = cfg->talker_head_dim;
     int kv_dim = kv_heads * head_dim;
     int intermediate = cfg->talker_intermediate;
+    int vocab = cfg->talker_vocab_size;
 
     ctx->mtl_x = metal_buf_ensure(ctx->mtl_x, hidden * sizeof(float));
     ctx->mtl_x_norm = metal_buf_ensure(ctx->mtl_x_norm, hidden * sizeof(float));
@@ -153,6 +154,7 @@ static int ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
     ctx->mtl_attn_out = metal_buf_ensure(ctx->mtl_attn_out, num_heads * head_dim * sizeof(float));
     ctx->mtl_gate = metal_buf_ensure(ctx->mtl_gate, intermediate * sizeof(float));
     ctx->mtl_up = metal_buf_ensure(ctx->mtl_up, intermediate * sizeof(float));
+    ctx->mtl_logits = metal_buf_ensure(ctx->mtl_logits, vocab * sizeof(float));
     ctx->mtl_rope_cos = metal_buf_ensure(ctx->mtl_rope_cos, head_dim * sizeof(float));
     ctx->mtl_rope_sin = metal_buf_ensure(ctx->mtl_rope_sin, head_dim * sizeof(float));
 
@@ -160,6 +162,7 @@ static int ensure_talker_metal_scratch(qwen_tts_ctx_t *ctx) {
         ctx->mtl_q == METAL_BUF_INVALID || ctx->mtl_k == METAL_BUF_INVALID ||
         ctx->mtl_v == METAL_BUF_INVALID || ctx->mtl_attn_out == METAL_BUF_INVALID ||
         ctx->mtl_gate == METAL_BUF_INVALID || ctx->mtl_up == METAL_BUF_INVALID ||
+        ctx->mtl_logits == METAL_BUF_INVALID ||
         ctx->mtl_rope_cos == METAL_BUF_INVALID || ctx->mtl_rope_sin == METAL_BUF_INVALID) {
         return -1;
     }
@@ -283,13 +286,10 @@ static void talker_attention_single_metal(
                        num_heads, kv_heads, head_dim, eps);
     metal_kv_cache_store(ctx->mtl_kv_k, ctx->mtl_kv_v, ctx->mtl_k, ctx->mtl_v,
                          layer_idx, pos, kv_dim, ctx->mtl_kv_max);
-    metal_attn_scores(ctx->mtl_scores, ctx->mtl_q, ctx->mtl_kv_k,
-                      layer_idx, seq_len, ctx->mtl_kv_max,
-                      num_heads, kv_heads, head_dim, scale);
-    metal_attn_softmax_rows(ctx->mtl_scores, num_heads, seq_len, ctx->mtl_kv_max);
-    metal_attn_weighted_sum(ctx->mtl_attn_out, ctx->mtl_scores, ctx->mtl_kv_v,
-                            layer_idx, seq_len, ctx->mtl_kv_max,
-                            num_heads, kv_heads, head_dim);
+    metal_attn_fused(ctx->mtl_attn_out, ctx->mtl_scores, ctx->mtl_q,
+                     ctx->mtl_kv_k, ctx->mtl_kv_v,
+                     layer_idx, seq_len, ctx->mtl_kv_max,
+                     num_heads, kv_heads, head_dim, scale);
 
     /* Output projection + MLP */
     metal_matvec_bf16(ctx->mtl_x_norm, layer->mtl_wo, ctx->mtl_attn_out, hidden, num_heads * head_dim);
@@ -708,6 +708,10 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
     int use_metal_talker = 0;
 #ifdef USE_METAL
     use_metal_talker = metal_is_available() && should_use_metal_talker();
+    if (use_metal_talker &&
+        (ctx->talker.mtl_norm == METAL_BUF_INVALID || ctx->talker.mtl_codec_head == METAL_BUF_INVALID)) {
+        use_metal_talker = 0;
+    }
 #endif
 
     float *x = ctx->tk_x;
@@ -775,12 +779,28 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
         }
     }
 
-    if (x != ctx->tk_x) {
+    if (x != ctx->tk_x && !use_metal_talker) {
         memcpy(ctx->tk_x, x, hidden * sizeof(float));
         x = ctx->tk_x;
     }
 
-    /* Final norm + codec head projection (CPU — small ops, AMX is faster) */
+#ifdef USE_METAL
+    if (use_metal_talker) {
+        metal_begin();
+        metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, ctx->talker.mtl_norm, hidden, eps);
+        metal_matvec_bf16(ctx->mtl_logits, ctx->talker.mtl_codec_head,
+                          ctx->mtl_x_norm, cfg->talker_vocab_size, hidden);
+        metal_sync();
+
+        memcpy(ctx->tk_x, metal_buf_contents(ctx->mtl_x_norm), hidden * sizeof(float));
+        memcpy(logits, metal_buf_contents(ctx->mtl_logits),
+               (size_t)cfg->talker_vocab_size * sizeof(float));
+        ctx->talker_kv_len = pos + 1;
+        return;
+    }
+#endif
+
+    /* Final norm + codec head projection (CPU path) */
     kernel_rms_norm_inplace(x, ctx->talker.norm, hidden, eps);
     kernel_matvec_bf16(logits, ctx->talker.codec_head_bf16, x, cfg->talker_vocab_size, hidden);
 

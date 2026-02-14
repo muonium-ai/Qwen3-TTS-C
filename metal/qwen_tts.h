@@ -470,7 +470,7 @@ typedef struct {
 #ifdef USE_METAL
     /* Metal scratch buffers for talker single-token path */
     int mtl_x, mtl_x_norm, mtl_q, mtl_k, mtl_v;
-    int mtl_attn_out, mtl_gate, mtl_up;
+    int mtl_attn_out, mtl_gate, mtl_up, mtl_logits;
     int mtl_rope_cos, mtl_rope_sin;
     int mtl_scores;
     int mtl_kv_k, mtl_kv_v;     /* KV cache as Metal buffers */

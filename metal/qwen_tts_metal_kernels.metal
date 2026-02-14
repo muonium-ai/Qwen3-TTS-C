@@ -576,6 +576,84 @@ kernel void kernel_attn_weighted_sum_metal(
     out[(long)h * p.head_dim + d] = sum;
 }
 
+/* Fused attention for one token: scores + softmax + weighted sum */
+kernel void kernel_attn_fused_metal(
+    device float *out [[buffer(0)]],
+    device float *scores [[buffer(1)]],
+    const device float *q [[buffer(2)]],
+    const device float *kv_k [[buffer(3)]],
+    const device float *kv_v [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    if ((int)head >= p.num_heads) return;
+
+    int h = (int)head;
+    int kv_h = h / p.groups_per_head;
+    const device float *qh = q + (long)h * p.head_dim;
+    long row_base = (long)h * p.kv_max;
+
+    threadgroup float shared_val[256];
+
+    /* 1) Scores + max */
+    float local_max = -INFINITY;
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        const device float *kh = kv_k + ((long)p.layer_idx * p.kv_max + t) * p.kv_dim +
+                                 (long)kv_h * p.head_dim;
+        float score = 0.0f;
+        for (int i = 0; i < p.head_dim; i++) {
+            score += qh[i] * kh[i];
+        }
+        score *= p.scale;
+        scores[row_base + t] = score;
+        local_max = max(local_max, score);
+    }
+    shared_val[tid] = local_max;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_val[tid] = max(shared_val[tid], shared_val[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float max_val = shared_val[0];
+
+    /* 2) exp + sum */
+    float local_sum = 0.0f;
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        float e = exp(scores[row_base + t] - max_val);
+        scores[row_base + t] = e;
+        local_sum += e;
+    }
+    shared_val[tid] = local_sum;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) shared_val[tid] += shared_val[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / shared_val[0];
+
+    /* 3) normalize */
+    for (int t = (int)tid; t < p.seq_len; t += (int)tg_size) {
+        scores[row_base + t] *= inv_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    /* 4) weighted sum */
+    for (int d = (int)tid; d < p.head_dim; d += (int)tg_size) {
+        float acc = 0.0f;
+        for (int t = 0; t < p.seq_len; t++) {
+            float w = scores[row_base + t];
+            const device float *vh = kv_v + ((long)p.layer_idx * p.kv_max + t) * p.kv_dim +
+                                     (long)kv_h * p.head_dim;
+            acc += w * vh[d];
+        }
+        out[(long)h * p.head_dim + d] = acc;
+    }
+}
+
 /* ========================================================================
  * Activation Functions
  * ======================================================================== */

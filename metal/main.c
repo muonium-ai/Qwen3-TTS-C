@@ -15,6 +15,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+static double now_ms(void) {
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -42,6 +49,8 @@ static void usage(const char *prog) {
         "  --subtalker-temperature <f>  Sub-talker temperature (default: 0.9)\n"
         "  --subtalker-top-k <n>        Sub-talker top-K (default: 50)\n"
         "  --subtalker-top-p <f>        Sub-talker top-P (default: 1.0)\n"
+        "  --benchmark-runs <n>         Run n measured generations in one process (default: 1)\n"
+        "  --benchmark-warmup <n>       Warmup generations before measured runs (default: 0)\n"
         "\n"
         "Token format:\n"
         "  Token IDs should follow the Qwen2 chat template:\n"
@@ -107,6 +116,8 @@ int main(int argc, char **argv) {
     float subtalker_top_p = -1;
     float repetition_penalty = -1;
     int max_tokens = -1;
+    int benchmark_runs = 1;
+    int benchmark_warmup = 0;
 
     /* Parse arguments */
     for (int i = 1; i < argc; i++) {
@@ -140,6 +151,10 @@ int main(int argc, char **argv) {
             subtalker_top_k = (int)strtol(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--subtalker-top-p") == 0 && i + 1 < argc) {
             subtalker_top_p = strtof(argv[++i], NULL);
+        } else if (strcmp(argv[i], "--benchmark-runs") == 0 && i + 1 < argc) {
+            benchmark_runs = (int)strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--benchmark-warmup") == 0 && i + 1 < argc) {
+            benchmark_warmup = (int)strtol(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -159,6 +174,11 @@ int main(int argc, char **argv) {
     if (!token_ids && !token_file) {
         fprintf(stderr, "Error: token IDs required (-t or -f)\n\n");
         usage(argv[0]);
+        return 1;
+    }
+
+    if (benchmark_runs < 1 || benchmark_warmup < 0) {
+        fprintf(stderr, "Error: invalid benchmark settings (--benchmark-runs >= 1, --benchmark-warmup >= 0)\n");
         return 1;
     }
 
@@ -209,20 +229,55 @@ int main(int argc, char **argv) {
         if (language) fprintf(stderr, "Language: %s\n", language);
     }
 
-    /* ---- Generate ---- */
+    /* ---- Generate (single run or persistent benchmark mode) ---- */
     int n_samples = 0;
-    float *audio = qwen_tts_generate(ctx, token_ids, speaker, language, &n_samples);
+    float *audio = NULL;
+    int total_runs = benchmark_warmup + benchmark_runs;
+    for (int run = 0; run < total_runs; run++) {
+        double t0 = now_ms();
+        int run_samples = 0;
+        float *run_audio = qwen_tts_generate(ctx, token_ids, speaker, language, &run_samples);
+        double elapsed_ms = now_ms() - t0;
 
-    if (verbose == 0) fprintf(stderr, "\n");  /* newline after progress */
+        if (verbose == 0) fprintf(stderr, "\n");
+
+        if (!run_audio || run_samples == 0) {
+            fprintf(stderr, "Error: generation produced no audio\n");
+            free(run_audio);
+            free(audio);
+            qwen_tts_free(ctx);
+            free(file_tokens);
+            return 1;
+        }
+
+        int measured_idx = run - benchmark_warmup;
+        if (measured_idx >= 0 && benchmark_runs > 1) {
+            float run_audio_sec = (float)run_samples / QWEN_TTS_SAMPLE_RATE;
+            fprintf(stderr,
+                    "[persistent] run %d/%d: elapsed=%.1f ms, audio=%.2fs, "
+                    "talker=%.1f ms, codec=%.1f ms, total=%.1f ms, tokens=%d\n",
+                    measured_idx + 1, benchmark_runs, elapsed_ms, run_audio_sec,
+                    ctx->perf_talker_ms, ctx->perf_codec_ms, ctx->perf_total_ms,
+                    ctx->perf_codec_tokens);
+        }
+
+        if (run == total_runs - 1) {
+            free(audio);
+            audio = run_audio;
+            n_samples = run_samples;
+        } else {
+            free(run_audio);
+        }
+    }
 
     if (!audio || n_samples == 0) {
         fprintf(stderr, "Error: generation produced no audio\n");
+        free(audio);
         qwen_tts_free(ctx);
         free(file_tokens);
         return 1;
     }
 
-    /* ---- Write WAV ---- */
     if (qwen_tts_write_wav(output_path, audio, n_samples, QWEN_TTS_SAMPLE_RATE) != 0) {
         fprintf(stderr, "Error: failed to write %s\n", output_path);
         free(audio);

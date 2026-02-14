@@ -79,7 +79,34 @@ def parse_c_stderr(stderr: str) -> tuple[float | None, int | None, str | None]:
     return internal_ms, codec_tokens, stop
 
 
-def run_c_binary(
+_PERSISTENT_RE = re.compile(
+    r"\[persistent\]\s+run\s+(\d+)/(\d+):\s+elapsed=([0-9.]+)\s+ms,\s+audio=([0-9.]+)s,\s+"
+    r"talker=([0-9.]+)\s+ms,\s+codec=([0-9.]+)\s+ms,\s+total=([0-9.]+)\s+ms,\s+tokens=(\d+)"
+)
+
+
+def parse_persistent_runs(stderr: str) -> list[RunResult]:
+    stop = None
+    if "Stop: eos" in stderr or "EOS at step" in stderr:
+        stop = "eos"
+    elif "Stop: max_tokens" in stderr:
+        stop = "max_tokens"
+
+    out: list[RunResult] = []
+    for m in _PERSISTENT_RE.finditer(stderr):
+        out.append(
+            RunResult(
+                elapsed_ms=float(m.group(3)),
+                audio_sec=float(m.group(4)),
+                codec_tokens=int(m.group(8)),
+                stop_reason=stop,
+                internal_total_ms=float(m.group(7)),
+            )
+        )
+    return out
+
+
+def build_c_cmd(
     binary: Path,
     model_dir: str,
     token_ids: str,
@@ -87,7 +114,9 @@ def run_c_binary(
     language: str,
     args: argparse.Namespace,
     out_wav: Path,
-) -> RunResult:
+    bench_runs: int | None = None,
+    bench_warmup: int | None = None,
+) -> list[str]:
     cmd = [
         str(binary), "-d", model_dir, "-t", token_ids,
         "-o", str(out_wav), "-v", "-s", speaker, "-l", language,
@@ -100,6 +129,23 @@ def run_c_binary(
         "--subtalker-top-p", str(args.subtalker_top_p),
         "--max-tokens", str(args.max_new_tokens),
     ]
+    if bench_runs is not None:
+        cmd += ["--benchmark-runs", str(bench_runs)]
+    if bench_warmup is not None:
+        cmd += ["--benchmark-warmup", str(bench_warmup)]
+    return cmd
+
+
+def run_c_binary(
+    binary: Path,
+    model_dir: str,
+    token_ids: str,
+    speaker: str,
+    language: str,
+    args: argparse.Namespace,
+    out_wav: Path,
+) -> RunResult:
+    cmd = build_c_cmd(binary, model_dir, token_ids, speaker, language, args, out_wav)
     start = time.perf_counter()
     proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
@@ -124,6 +170,36 @@ def bench_binary(
     args: argparse.Namespace,
     out_dir: Path,
 ) -> list[RunResult]:
+    if args.persistent:
+        wav_path = out_dir / f"{label}_output.wav"
+        cmd = build_c_cmd(
+            binary, model_dir, token_ids, speaker, language, args, wav_path,
+            bench_runs=args.runs, bench_warmup=args.warmup
+        )
+        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        results = parse_persistent_runs(proc.stderr)
+        if not results:
+            # Fallback to single-result parsing if binary does not emit persistent lines.
+            audio_sec = wav_duration(wav_path)
+            internal_ms, codec_tokens, stop = parse_c_stderr(proc.stderr)
+            elapsed_ms = internal_ms if internal_ms is not None else audio_sec * 1000.0
+            results = [RunResult(
+                elapsed_ms=elapsed_ms,
+                audio_sec=audio_sec,
+                codec_tokens=codec_tokens,
+                stop_reason=stop,
+                internal_total_ms=internal_ms,
+            )]
+        for i, rr in enumerate(results):
+            tok_info = f", {rr.codec_tokens} tokens" if rr.codec_tokens else ""
+            ms_tok = f", {rr.ms_per_token:.1f} ms/tok" if rr.ms_per_token else ""
+            print(
+                f"  [{label}] run {i+1}/{len(results)}: "
+                f"{rr.elapsed_ms:.0f} ms, {rr.audio_sec:.2f}s audio, "
+                f"RTF={rr.rtf:.2f}x{tok_info}{ms_tok}"
+            )
+        return results
+
     results: list[RunResult] = []
 
     # Warmup
@@ -349,6 +425,8 @@ def main() -> int:
     parser.add_argument("--skip-c", action="store_true", help="Skip C CPU benchmark")
     parser.add_argument("--skip-metal", action="store_true", help="Skip Metal GPU benchmark")
     parser.add_argument("--output-dir", default="benchmark_output")
+    parser.add_argument("--persistent", action="store_true",
+                        help="Use process-persistent C/Metal benchmark mode")
     args = parser.parse_args()
 
     out_dir = Path(args.output_dir)
@@ -400,6 +478,7 @@ def main() -> int:
             "max_new_tokens": args.max_new_tokens,
             "temperature": args.temperature,
             "top_k": args.top_k,
+            "persistent": args.persistent,
         },
     }
 

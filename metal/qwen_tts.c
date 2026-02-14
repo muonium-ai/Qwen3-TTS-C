@@ -932,6 +932,7 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     ctx->mtl_attn_out = METAL_BUF_INVALID;
     ctx->mtl_gate = METAL_BUF_INVALID;
     ctx->mtl_up = METAL_BUF_INVALID;
+    ctx->mtl_logits = METAL_BUF_INVALID;
     ctx->mtl_rope_cos = METAL_BUF_INVALID;
     ctx->mtl_rope_sin = METAL_BUF_INVALID;
     ctx->mtl_scores = METAL_BUF_INVALID;

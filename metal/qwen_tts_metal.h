@@ -153,6 +153,10 @@ void metal_attn_softmax_rows(metal_buf_t scores, int num_heads, int seq_len, int
 void metal_attn_weighted_sum(metal_buf_t out, metal_buf_t scores, metal_buf_t kv_v,
                              int layer_idx, int seq_len, int kv_max,
                              int num_heads, int kv_heads, int head_dim);
+void metal_attn_fused(metal_buf_t out, metal_buf_t scores, metal_buf_t q,
+                      metal_buf_t kv_k, metal_buf_t kv_v,
+                      int layer_idx, int seq_len, int kv_max,
+                      int num_heads, int kv_heads, int head_dim, float scale);
 
 /* --- Activations --- */
 
