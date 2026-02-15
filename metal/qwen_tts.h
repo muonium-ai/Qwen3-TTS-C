@@ -340,6 +340,12 @@ typedef struct {
     float *act2_beta;              /* [dim] */
     float *conv2_weight;           /* [dim, dim, 1] */
     float *conv2_bias;             /* [dim] */
+#ifdef USE_METAL
+    int mtl_act1_alpha, mtl_act1_beta;
+    int mtl_conv1_weight, mtl_conv1_bias;
+    int mtl_act2_alpha, mtl_act2_beta;
+    int mtl_conv2_weight, mtl_conv2_bias;
+#endif
 } qwen_tts_vocoder_resunit_t;
 
 /* Vocoder decoder block (SnakeBeta + TransConv + 3 residual units) */
@@ -349,6 +355,10 @@ typedef struct {
     float *transconv_weight;       /* [in_dim, out_dim, kernel] */
     float *transconv_bias;         /* [out_dim] */
     qwen_tts_vocoder_resunit_t resunits[3];  /* dilations 1, 3, 9 */
+#ifdef USE_METAL
+    int mtl_act_alpha, mtl_act_beta;
+    int mtl_transconv_weight, mtl_transconv_bias;
+#endif
 } qwen_tts_vocoder_block_t;
 
 typedef struct {
@@ -389,6 +399,9 @@ typedef struct {
     int mtl_input_proj_weight, mtl_input_proj_bias;
     int mtl_output_proj_weight, mtl_output_proj_bias;
     int mtl_transformer_norm;
+    int mtl_vocoder_pre_conv_weight, mtl_vocoder_pre_conv_bias;
+    int mtl_vocoder_final_act_alpha, mtl_vocoder_final_act_beta;
+    int mtl_vocoder_final_conv_weight, mtl_vocoder_final_conv_bias;
 #endif
 } qwen_tts_codec_decoder_t;
 

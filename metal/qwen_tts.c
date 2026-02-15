@@ -863,6 +863,68 @@ static int ensure_codec_loaded(qwen_tts_ctx_t *ctx) {
                 ctx->codec.transformer_norm,
                 codec_hidden * sizeof(float));
 
+        /* Experimental Metal vocoder path: upload only when explicitly enabled. */
+        const char *codec_vocoder_env = getenv("QWEN_TTS_METAL_CODEC_VOCODER");
+        int upload_codec_vocoder = (codec_vocoder_env && atoi(codec_vocoder_env) != 0) ? 1 : 0;
+        if (upload_codec_vocoder) {
+            int decoder_dim = ccfg->codec_decoder_dim;
+            if (ctx->codec.vocoder_pre_conv_weight)
+                ctx->codec.mtl_vocoder_pre_conv_weight = metal_buf_from_ptr(
+                    ctx->codec.vocoder_pre_conv_weight,
+                    (size_t)decoder_dim * ccfg->codec_latent * 7 * sizeof(float));
+            if (ctx->codec.vocoder_pre_conv_bias)
+                ctx->codec.mtl_vocoder_pre_conv_bias = metal_buf_create(
+                    ctx->codec.vocoder_pre_conv_bias,
+                    decoder_dim * sizeof(float));
+
+            for (int b = 0; b < 4; b++) {
+                int in_dim = decoder_dim >> b;
+                int out_dim = in_dim / 2;
+                int rate = ccfg->codec_upsample_rates[b];
+                int kernel = 2 * rate;
+                qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[b];
+
+                if (vb->act_alpha) vb->mtl_act_alpha = metal_buf_create(vb->act_alpha, (size_t)in_dim * sizeof(float));
+                if (vb->act_beta) vb->mtl_act_beta = metal_buf_create(vb->act_beta, (size_t)in_dim * sizeof(float));
+                if (vb->transconv_weight) vb->mtl_transconv_weight = metal_buf_from_ptr(
+                    vb->transconv_weight, (size_t)in_dim * out_dim * kernel * sizeof(float));
+                if (vb->transconv_bias) vb->mtl_transconv_bias = metal_buf_create(
+                    vb->transconv_bias, (size_t)out_dim * sizeof(float));
+
+                for (int r = 0; r < 3; r++) {
+                    qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+                    if (ru->act1_alpha) ru->mtl_act1_alpha = metal_buf_create(ru->act1_alpha, (size_t)out_dim * sizeof(float));
+                    if (ru->act1_beta) ru->mtl_act1_beta = metal_buf_create(ru->act1_beta, (size_t)out_dim * sizeof(float));
+                    if (ru->conv1_weight) ru->mtl_conv1_weight = metal_buf_from_ptr(
+                        ru->conv1_weight, (size_t)out_dim * out_dim * 7 * sizeof(float));
+                    if (ru->conv1_bias) ru->mtl_conv1_bias = metal_buf_create(ru->conv1_bias, (size_t)out_dim * sizeof(float));
+                    if (ru->act2_alpha) ru->mtl_act2_alpha = metal_buf_create(ru->act2_alpha, (size_t)out_dim * sizeof(float));
+                    if (ru->act2_beta) ru->mtl_act2_beta = metal_buf_create(ru->act2_beta, (size_t)out_dim * sizeof(float));
+                    if (ru->conv2_weight) ru->mtl_conv2_weight = metal_buf_from_ptr(
+                        ru->conv2_weight, (size_t)out_dim * out_dim * sizeof(float));
+                    if (ru->conv2_bias) ru->mtl_conv2_bias = metal_buf_create(ru->conv2_bias, (size_t)out_dim * sizeof(float));
+                }
+            }
+
+            int final_dim = decoder_dim / 16;
+            if (ctx->codec.vocoder_final_act_alpha)
+                ctx->codec.mtl_vocoder_final_act_alpha = metal_buf_create(
+                    ctx->codec.vocoder_final_act_alpha,
+                    (size_t)final_dim * sizeof(float));
+            if (ctx->codec.vocoder_final_act_beta)
+                ctx->codec.mtl_vocoder_final_act_beta = metal_buf_create(
+                    ctx->codec.vocoder_final_act_beta,
+                    (size_t)final_dim * sizeof(float));
+            if (ctx->codec.vocoder_final_conv_weight)
+                ctx->codec.mtl_vocoder_final_conv_weight = metal_buf_from_ptr(
+                    ctx->codec.vocoder_final_conv_weight,
+                    (size_t)final_dim * 7 * sizeof(float));
+            if (ctx->codec.vocoder_final_conv_bias)
+                ctx->codec.mtl_vocoder_final_conv_bias = metal_buf_create(
+                    ctx->codec.vocoder_final_conv_bias,
+                    sizeof(float));
+        }
+
         if (qwen_tts_verbose >= 1)
             fprintf(stderr, "Metal: uploaded codec weights\n");
     }
@@ -965,6 +1027,52 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
 
 #ifdef USE_METAL
     /* Initialize optional Metal weight handles to invalid for robust fallback checks. */
+    ctx->codec.mtl_input_proj_weight = METAL_BUF_INVALID;
+    ctx->codec.mtl_input_proj_bias = METAL_BUF_INVALID;
+    ctx->codec.mtl_output_proj_weight = METAL_BUF_INVALID;
+    ctx->codec.mtl_output_proj_bias = METAL_BUF_INVALID;
+    ctx->codec.mtl_transformer_norm = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_pre_conv_weight = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_pre_conv_bias = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_final_act_alpha = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_final_act_beta = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_final_conv_weight = METAL_BUF_INVALID;
+    ctx->codec.mtl_vocoder_final_conv_bias = METAL_BUF_INVALID;
+
+    for (int i = 0; i < ctx->config.codec_layers; i++) {
+        qwen_tts_codec_transformer_layer_t *l = &ctx->codec.transformer_layers[i];
+        l->mtl_input_norm = METAL_BUF_INVALID;
+        l->mtl_post_attn_norm = METAL_BUF_INVALID;
+        l->mtl_attn_layer_scale = METAL_BUF_INVALID;
+        l->mtl_mlp_layer_scale = METAL_BUF_INVALID;
+        l->mtl_wq = METAL_BUF_INVALID;
+        l->mtl_wk = METAL_BUF_INVALID;
+        l->mtl_wv = METAL_BUF_INVALID;
+        l->mtl_wo = METAL_BUF_INVALID;
+        l->mtl_gate = METAL_BUF_INVALID;
+        l->mtl_up = METAL_BUF_INVALID;
+        l->mtl_down = METAL_BUF_INVALID;
+    }
+
+    for (int b = 0; b < 4; b++) {
+        qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[b];
+        vb->mtl_act_alpha = METAL_BUF_INVALID;
+        vb->mtl_act_beta = METAL_BUF_INVALID;
+        vb->mtl_transconv_weight = METAL_BUF_INVALID;
+        vb->mtl_transconv_bias = METAL_BUF_INVALID;
+        for (int r = 0; r < 3; r++) {
+            qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+            ru->mtl_act1_alpha = METAL_BUF_INVALID;
+            ru->mtl_act1_beta = METAL_BUF_INVALID;
+            ru->mtl_conv1_weight = METAL_BUF_INVALID;
+            ru->mtl_conv1_bias = METAL_BUF_INVALID;
+            ru->mtl_act2_alpha = METAL_BUF_INVALID;
+            ru->mtl_act2_beta = METAL_BUF_INVALID;
+            ru->mtl_conv2_weight = METAL_BUF_INVALID;
+            ru->mtl_conv2_bias = METAL_BUF_INVALID;
+        }
+    }
+
     ctx->subtalker.mtl_input_proj = METAL_BUF_INVALID;
     ctx->subtalker.mtl_input_proj_bias = METAL_BUF_INVALID;
     ctx->subtalker.mtl_norm = METAL_BUF_INVALID;

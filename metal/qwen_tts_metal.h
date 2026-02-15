@@ -174,6 +174,7 @@ void metal_snake_beta(metal_buf_t out, metal_buf_t x, metal_buf_t alpha,
 
 void metal_add_inplace(metal_buf_t a, metal_buf_t b, int n);
 void metal_mul_inplace(metal_buf_t a, metal_buf_t b, int n);
+void metal_copy(metal_buf_t dst, metal_buf_t src, int n);
 void metal_scale_inplace(metal_buf_t x, float scale, int n);
 void metal_clamp(metal_buf_t x, int n, float min_val, float max_val);
 

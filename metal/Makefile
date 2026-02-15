@@ -30,6 +30,8 @@ BIN = qwen-tts-metal
 
 UNAME_S := $(shell uname -s)
 OPENMP ?= 1
+FAST_MATH ?= 0
+OPT_LEVEL ?= -O3
 
 # ---- Metal configuration (macOS only) ----
 ifeq ($(UNAME_S),Darwin)
@@ -90,6 +92,11 @@ endif
 
 LDFLAGS += -lm
 
+ifeq ($(FAST_MATH),1)
+  OPT_LEVEL := -Ofast
+  CFLAGS += -ffast-math -fno-math-errno
+endif
+
 # ---- Metal flags ----
 ifeq ($(USE_METAL),1)
   CFLAGS  += -DUSE_METAL
@@ -104,12 +111,12 @@ endif
 # ---- Build targets ----
 
 .PHONY: all
-all: CFLAGS += -O3 -march=native -DNDEBUG
+all: CFLAGS += $(OPT_LEVEL) -march=native -DNDEBUG
 all: $(BIN)
 
 .PHONY: cpu
 cpu: USE_METAL = 0
-cpu: CFLAGS += -O3 -march=native -DNDEBUG
+cpu: CFLAGS += $(OPT_LEVEL) -march=native -DNDEBUG
 cpu: BIN = qwen-tts-cpu
 cpu:
 	$(CC) $(CFLAGS) -o qwen-tts-cpu $(C_SRCS) $(LDFLAGS)

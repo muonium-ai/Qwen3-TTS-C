@@ -19,6 +19,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef USE_METAL
+#include "qwen_tts_metal.h"
+#endif
 
 extern int qwen_tts_verbose;
 
@@ -27,6 +30,19 @@ static double now_ms(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
 }
+
+#ifdef USE_METAL
+static int should_use_metal_codec_vocoder(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("QWEN_TTS_METAL_CODEC_VOCODER");
+        enabled = (env && atoi(env) != 0) ? 1 : 0;
+        initialized = 1;
+    }
+    return enabled;
+}
+#endif
 
 static int codec_decoder_weights_ready(const qwen_tts_ctx_t *ctx) {
     const qwen_tts_config_t *cfg = &ctx->config;
@@ -265,8 +281,6 @@ static float *codec_rvq_dequantize(qwen_tts_ctx_t *ctx, const int *codes,
  * ======================================================================== */
 
 #ifdef USE_METAL
-#include "qwen_tts_metal.h"
-
 static void codec_transformer_forward_metal(qwen_tts_ctx_t *ctx, float *hidden,
                                              int seq_len) {
     qwen_tts_config_t *cfg = &ctx->config;
@@ -785,6 +799,143 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
     return 0;
 }
 
+#ifdef USE_METAL
+static int codec_vocoder_weights_ready_metal(const qwen_tts_ctx_t *ctx) {
+    const qwen_tts_codec_decoder_t *codec = &ctx->codec;
+    if (!metal_is_available()) return 0;
+    if (codec->mtl_vocoder_pre_conv_weight == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_pre_conv_bias == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_final_act_alpha == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_final_act_beta == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_final_conv_weight == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_final_conv_bias == METAL_BUF_INVALID) {
+        return 0;
+    }
+
+    for (int b = 0; b < 4; b++) {
+        const qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
+        if (vb->mtl_act_alpha == METAL_BUF_INVALID ||
+            vb->mtl_act_beta == METAL_BUF_INVALID ||
+            vb->mtl_transconv_weight == METAL_BUF_INVALID ||
+            vb->mtl_transconv_bias == METAL_BUF_INVALID) {
+            return 0;
+        }
+        for (int r = 0; r < 3; r++) {
+            const qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+            if (ru->mtl_act1_alpha == METAL_BUF_INVALID ||
+                ru->mtl_act1_beta == METAL_BUF_INVALID ||
+                ru->mtl_conv1_weight == METAL_BUF_INVALID ||
+                ru->mtl_conv1_bias == METAL_BUF_INVALID ||
+                ru->mtl_act2_alpha == METAL_BUF_INVALID ||
+                ru->mtl_act2_beta == METAL_BUF_INVALID ||
+                ru->mtl_conv2_weight == METAL_BUF_INVALID ||
+                ru->mtl_conv2_bias == METAL_BUF_INVALID) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static float *codec_vocoder_forward_metal(qwen_tts_ctx_t *ctx, const float *hidden,
+                                          int latent_dim, int length, int *out_samples) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    qwen_tts_codec_decoder_t *codec = &ctx->codec;
+    int decoder_dim = cfg->codec_decoder_dim;
+    int current_dim = decoder_dim;
+    int current_len = length;
+
+    metal_buf_t mtl_hidden = METAL_BUF_INVALID;
+    metal_buf_t mtl_voc = METAL_BUF_INVALID;
+    metal_buf_t mtl_tmp = METAL_BUF_INVALID;
+    metal_buf_t mtl_res = METAL_BUF_INVALID;
+    metal_buf_t mtl_wav = METAL_BUF_INVALID;
+    float *wav = NULL;
+
+    mtl_hidden = metal_buf_create(hidden, (size_t)latent_dim * current_len * sizeof(float));
+    mtl_voc = metal_buf_create_empty((size_t)current_dim * current_len * sizeof(float));
+    if (mtl_hidden == METAL_BUF_INVALID || mtl_voc == METAL_BUF_INVALID) goto fail;
+
+    metal_begin();
+
+    /* Initial conv: latent -> decoder_dim */
+    metal_causal_conv1d(mtl_voc, mtl_hidden, codec->mtl_vocoder_pre_conv_weight,
+                        codec->mtl_vocoder_pre_conv_bias,
+                        latent_dim, current_dim, 7, current_len, 1, 1);
+    metal_buf_release(mtl_hidden);
+    mtl_hidden = METAL_BUF_INVALID;
+
+    int dilations[3] = {1, 3, 9};
+    for (int b = 0; b < 4; b++) {
+        qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
+        int in_dim = current_dim;
+        int out_dim = in_dim / 2;
+        int rate = cfg->codec_upsample_rates[b];
+        int kernel = 2 * rate;
+        int new_len = 0;
+
+        metal_snake_beta(mtl_voc, mtl_voc, vb->mtl_act_alpha, vb->mtl_act_beta, in_dim, current_len);
+
+        metal_buf_t mtl_next = metal_buf_create_empty((size_t)out_dim * current_len * rate * sizeof(float));
+        if (mtl_next == METAL_BUF_INVALID) goto fail;
+        metal_transposed_conv1d(mtl_next, mtl_voc, vb->mtl_transconv_weight, vb->mtl_transconv_bias,
+                                in_dim, out_dim, kernel, rate, current_len, &new_len);
+        metal_buf_release(mtl_voc);
+        mtl_voc = mtl_next;
+        current_dim = out_dim;
+        current_len = new_len;
+
+        size_t cur_elems = (size_t)current_dim * current_len;
+        mtl_tmp = metal_buf_ensure(mtl_tmp, cur_elems * sizeof(float));
+        mtl_res = metal_buf_ensure(mtl_res, cur_elems * sizeof(float));
+        if (mtl_tmp == METAL_BUF_INVALID || mtl_res == METAL_BUF_INVALID) goto fail;
+
+        for (int r = 0; r < 3; r++) {
+            qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+            metal_copy(mtl_res, mtl_voc, (int)cur_elems);
+            metal_snake_beta(mtl_voc, mtl_voc, ru->mtl_act1_alpha, ru->mtl_act1_beta, current_dim, current_len);
+            metal_causal_conv1d(mtl_tmp, mtl_voc, ru->mtl_conv1_weight, ru->mtl_conv1_bias,
+                                current_dim, current_dim, 7, current_len, dilations[r], 1);
+            metal_snake_beta(mtl_tmp, mtl_tmp, ru->mtl_act2_alpha, ru->mtl_act2_beta, current_dim, current_len);
+            metal_causal_conv1d(mtl_voc, mtl_tmp, ru->mtl_conv2_weight, ru->mtl_conv2_bias,
+                                current_dim, current_dim, 1, current_len, 1, 1);
+            metal_add_inplace(mtl_voc, mtl_res, (int)cur_elems);
+        }
+    }
+
+    metal_snake_beta(mtl_voc, mtl_voc, codec->mtl_vocoder_final_act_alpha,
+                     codec->mtl_vocoder_final_act_beta, current_dim, current_len);
+    mtl_wav = metal_buf_create_empty((size_t)current_len * sizeof(float));
+    if (mtl_wav == METAL_BUF_INVALID) goto fail;
+    metal_causal_conv1d(mtl_wav, mtl_voc, codec->mtl_vocoder_final_conv_weight,
+                        codec->mtl_vocoder_final_conv_bias,
+                        current_dim, 1, 7, current_len, 1, 1);
+    metal_clamp(mtl_wav, current_len, -1.0f, 1.0f);
+    metal_sync();
+
+    wav = (float *)malloc((size_t)current_len * sizeof(float));
+    if (!wav) goto fail;
+    memcpy(wav, metal_buf_contents(mtl_wav), (size_t)current_len * sizeof(float));
+    *out_samples = current_len;
+
+    metal_buf_release(mtl_voc);
+    metal_buf_release(mtl_tmp);
+    metal_buf_release(mtl_res);
+    metal_buf_release(mtl_wav);
+    return wav;
+
+fail:
+    metal_sync();
+    metal_buf_release(mtl_hidden);
+    metal_buf_release(mtl_voc);
+    metal_buf_release(mtl_tmp);
+    metal_buf_release(mtl_res);
+    metal_buf_release(mtl_wav);
+    *out_samples = 0;
+    return NULL;
+}
+#endif
+
 /* ========================================================================
  * Full codec decode pipeline
  * ======================================================================== */
@@ -875,78 +1026,92 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
 
     /* 7. Vocoder */
     stage_t0 = now_ms();
+    float *wav = NULL;
 
-    /* 7a. Initial conv: CausalConv1d(latent_dim, decoder_dim, k=7) */
-    int decoder_dim = cfg->codec_decoder_dim;
-    float *voc = (float *)malloc((size_t)decoder_dim * current_len * sizeof(float));
-    kernel_causal_conv1d(voc, hidden, ctx->codec.vocoder_pre_conv_weight,
-                         ctx->codec.vocoder_pre_conv_bias,
-                         latent_dim, decoder_dim, 7, current_len, 1, 1);
-    free(hidden);
-
-    /* 7b. 4 decoder blocks: SnakeBeta → TransConv → 3 ResUnits */
-    int upsample_rates[4] = {
-        cfg->codec_upsample_rates[0],
-        cfg->codec_upsample_rates[1],
-        cfg->codec_upsample_rates[2],
-        cfg->codec_upsample_rates[3],
-    };
-    int current_dim = decoder_dim;
-    vocoder_resunit_scratch_t ru_scratch = {0};
-
-    for (int block = 0; block < 4; block++) {
-        int in_dim = current_dim;
-        int out_dim = in_dim / 2;
-        int rate = upsample_rates[block];
-        qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
-
-        /* SnakeBeta activation (in-place) */
-        kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
-
-        /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
-        int new_len;
-        int kernel = 2 * rate;
-        float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
-        kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
-                                  in_dim, out_dim, kernel, rate, current_len, &new_len);
-        free(voc);
-
-        voc = (float *)realloc(transconv_out, (size_t)out_dim * new_len * sizeof(float));
-        current_len = new_len;
-        current_dim = out_dim;
-
-        /* 3 Residual units with dilations 1, 3, 9 */
-        int dilations[3] = {1, 3, 9};
-        for (int ru = 0; ru < 3; ru++) {
-            if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
-                                        dilations[ru], &ru_scratch) != 0) {
-                free(voc);
-                free(ru_scratch.residual);
-                free(ru_scratch.conv1_out);
-                *out_samples = 0;
-                return NULL;
-            }
+#ifdef USE_METAL
+    if (should_use_metal_codec_vocoder() && codec_vocoder_weights_ready_metal(ctx)) {
+        wav = codec_vocoder_forward_metal(ctx, hidden, latent_dim, current_len, out_samples);
+        if (wav) {
+            stage_vocoder_ms = now_ms() - stage_t0;
+            current_len = *out_samples;
+            free(hidden);
         }
     }
+#endif
 
-    /* 7c. Final: SnakeBeta → CausalConv1d → output channel 1 */
-    kernel_snake_beta(voc, voc, ctx->codec.vocoder_final_act_alpha,
-                      ctx->codec.vocoder_final_act_beta, current_dim, current_len);
+    if (!wav) {
+        /* 7a. Initial conv: CausalConv1d(latent_dim, decoder_dim, k=7) */
+        int decoder_dim = cfg->codec_decoder_dim;
+        float *voc = (float *)malloc((size_t)decoder_dim * current_len * sizeof(float));
+        kernel_causal_conv1d(voc, hidden, ctx->codec.vocoder_pre_conv_weight,
+                             ctx->codec.vocoder_pre_conv_bias,
+                             latent_dim, decoder_dim, 7, current_len, 1, 1);
+        free(hidden);
 
-    /* Final conv: [current_dim, current_len] → [1, current_len] */
-    float *wav = (float *)malloc((size_t)current_len * sizeof(float));
-    kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
-                         ctx->codec.vocoder_final_conv_bias,
-                         current_dim, 1, 7, current_len, 1, 1);
-    free(voc);
-    free(ru_scratch.residual);
-    free(ru_scratch.conv1_out);
+        /* 7b. 4 decoder blocks: SnakeBeta → TransConv → 3 ResUnits */
+        int upsample_rates[4] = {
+            cfg->codec_upsample_rates[0],
+            cfg->codec_upsample_rates[1],
+            cfg->codec_upsample_rates[2],
+            cfg->codec_upsample_rates[3],
+        };
+        int current_dim = decoder_dim;
+        vocoder_resunit_scratch_t ru_scratch = {0};
 
-    /* 8. Clamp to [-1, 1] */
-    kernel_clamp(wav, current_len, -1.0f, 1.0f);
-    stage_vocoder_ms = now_ms() - stage_t0;
+        for (int block = 0; block < 4; block++) {
+            int in_dim = current_dim;
+            int out_dim = in_dim / 2;
+            int rate = upsample_rates[block];
+            qwen_tts_vocoder_block_t *vb = &ctx->codec.vocoder_blocks[block];
 
-    *out_samples = current_len;
+            /* SnakeBeta activation (in-place) */
+            kernel_snake_beta(voc, voc, vb->act_alpha, vb->act_beta, in_dim, current_len);
+
+            /* TransposedConv1d: [in_dim, current_len] → [out_dim, new_len] */
+            int new_len;
+            int kernel = 2 * rate;
+            float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
+            kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
+                                      in_dim, out_dim, kernel, rate, current_len, &new_len);
+            free(voc);
+
+            voc = (float *)realloc(transconv_out, (size_t)out_dim * new_len * sizeof(float));
+            current_len = new_len;
+            current_dim = out_dim;
+
+            /* 3 Residual units with dilations 1, 3, 9 */
+            int dilations[3] = {1, 3, 9};
+            for (int ru = 0; ru < 3; ru++) {
+                if (vocoder_resunit_forward(&vb->resunits[ru], voc, current_dim, current_len,
+                                            dilations[ru], &ru_scratch) != 0) {
+                    free(voc);
+                    free(ru_scratch.residual);
+                    free(ru_scratch.conv1_out);
+                    *out_samples = 0;
+                    return NULL;
+                }
+            }
+        }
+
+        /* 7c. Final: SnakeBeta → CausalConv1d → output channel 1 */
+        kernel_snake_beta(voc, voc, ctx->codec.vocoder_final_act_alpha,
+                          ctx->codec.vocoder_final_act_beta, current_dim, current_len);
+
+        /* Final conv: [current_dim, current_len] → [1, current_len] */
+        wav = (float *)malloc((size_t)current_len * sizeof(float));
+        kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
+                             ctx->codec.vocoder_final_conv_bias,
+                             current_dim, 1, 7, current_len, 1, 1);
+        free(voc);
+        free(ru_scratch.residual);
+        free(ru_scratch.conv1_out);
+
+        /* 8. Clamp to [-1, 1] */
+        kernel_clamp(wav, current_len, -1.0f, 1.0f);
+        stage_vocoder_ms = now_ms() - stage_t0;
+
+        *out_samples = current_len;
+    }
 
     if (qwen_tts_verbose >= 1)
         fprintf(stderr, "Codec decode complete: %d samples (%.2f seconds)\n",

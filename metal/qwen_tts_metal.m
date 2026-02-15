@@ -50,6 +50,7 @@ typedef struct {
     id<MTLComputePipelineState> ps_gelu_inplace;
     id<MTLComputePipelineState> ps_snake_beta;
     id<MTLComputePipelineState> ps_add_inplace;
+    id<MTLComputePipelineState> ps_copy;
     id<MTLComputePipelineState> ps_mul_inplace;
     id<MTLComputePipelineState> ps_scale_inplace;
     id<MTLComputePipelineState> ps_clamp;
@@ -217,6 +218,7 @@ int metal_init(void) {
         g_metal.ps_gelu_inplace = create_pipeline("kernel_gelu_inplace_metal");
         g_metal.ps_snake_beta = create_pipeline("kernel_snake_beta_metal");
         g_metal.ps_add_inplace = create_pipeline("kernel_add_inplace_metal");
+        g_metal.ps_copy = create_pipeline("kernel_copy_metal");
         g_metal.ps_mul_inplace = create_pipeline("kernel_mul_inplace_metal");
         g_metal.ps_scale_inplace = create_pipeline("kernel_scale_inplace_metal");
         g_metal.ps_clamp = create_pipeline("kernel_clamp_metal");
@@ -794,6 +796,17 @@ void metal_mul_inplace(metal_buf_t a, metal_buf_t b, int n) {
         metal_params_t p = {.n = n};
         [enc setBytes:&p length:sizeof(p) atIndex:2];
         dispatch_1d(enc, g_metal.ps_mul_inplace, n);
+    }
+}
+
+void metal_copy(metal_buf_t dst, metal_buf_t src, int n) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_copy);
+        [enc setBuffer:g_metal.buffers[dst] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[src] offset:0 atIndex:1];
+        metal_params_t p = {.n = n};
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch_1d(enc, g_metal.ps_copy, n);
     }
 }
 

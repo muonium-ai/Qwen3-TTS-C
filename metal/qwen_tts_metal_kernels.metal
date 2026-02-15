@@ -711,6 +711,16 @@ kernel void kernel_add_inplace_metal(
     a[gid] += b[gid];
 }
 
+kernel void kernel_copy_metal(
+    device float *dst [[buffer(0)]],
+    const device float *src [[buffer(1)]],
+    constant Params &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.n) return;
+    dst[gid] = src[gid];
+}
+
 kernel void kernel_mul_inplace_metal(
     device float *a [[buffer(0)]],
     const device float *b [[buffer(1)]],
