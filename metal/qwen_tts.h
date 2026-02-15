@@ -508,6 +508,9 @@ typedef struct {
     int mtl_sub_kv_max;
     int mtl_sub_embed;
     int mtl_sub_token;
+    int mtl_sub_codes;           /* GPU buffer for all subtalker codes [32 ints] */
+    int mtl_sub_rope_cos_all;    /* Full RoPE cos table on GPU [max_seq * head_dim] */
+    int mtl_sub_rope_sin_all;    /* Full RoPE sin table on GPU [max_seq * head_dim] */
 #endif
 } qwen_tts_ctx_t;
 

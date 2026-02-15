@@ -957,6 +957,43 @@ kernel void kernel_argmax_i32_metal(
 }
 
 /* ========================================================================
+ * Embed from Argmax (BF16)
+ * Reads an argmax token from a GPU buffer and uses it to index a BF16
+ * embedding table, producing a F32 embedding vector. Enables zero-sync
+ * chaining of autoregressive subtalker steps on GPU.
+ * Dispatch: dim threads.
+ * ======================================================================== */
+
+kernel void kernel_embed_from_argmax_bf16_metal(
+    device float *out [[buffer(0)]],
+    const device ushort *embeddings [[buffer(1)]],
+    const device int *token_buf [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= p.n) return;
+    int token = token_buf[0];
+    out[gid] = bf16_to_f32(embeddings[(uint)token * (uint)p.n + gid]);
+}
+
+/* ========================================================================
+ * Scatter Int: copy a single int from src[0] to dst[idx].
+ * Used to store argmax results into a codes buffer on GPU.
+ * Dispatch: 1 thread.
+ * ======================================================================== */
+
+kernel void kernel_scatter_int_metal(
+    device int *dst [[buffer(0)]],
+    const device int *src [[buffer(1)]],
+    constant Params &p [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid == 0) {
+        dst[p.n] = src[0];  /* p.n = destination index */
+    }
+}
+
+/* ========================================================================
  * SwiGLU Fused Matvec (BF16)
  * gate_up_fused: [2*intermediate, hidden] BF16
  * out[i] = silu(gate[i]) * up[i]

@@ -276,7 +276,7 @@ static int should_use_metal_talker(void) {
     static int enabled = 0;
     if (!initialized) {
         const char *env = getenv("QWEN_TTS_METAL_TALKER");
-        enabled = (env && atoi(env) != 0) ? 1 : 0;
+        enabled = env ? (atoi(env) != 0) : 1;  /* enabled by default */
         initialized = 1;
     }
     return enabled;
@@ -295,6 +295,86 @@ static int should_use_metal_subtalker(void) {
         initialized = 1;
     }
     return enabled;
+}
+
+/* GPU-only subtalker forward step for fused (zero-sync) chaining.
+ * Input must be in project_src_buf (GPU-resident). Uses pre-uploaded RoPE table
+ * with position offset. Never syncs — caller must sync after all steps. */
+static void subtalker_forward_step_fused(
+    qwen_tts_ctx_t *ctx,
+    metal_buf_t project_src_buf,  /* GPU buffer with input embedding */
+    int project_src_dim,
+    int pos,
+    metal_buf_t lm_head,
+    int st_vocab,
+    metal_buf_t rope_cos_all,     /* full RoPE cos table on GPU */
+    metal_buf_t rope_sin_all      /* full RoPE sin table on GPU */
+) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int st_hidden = cfg->subtalker_hidden;
+    int st_heads = cfg->subtalker_heads;
+    int st_kv_heads = cfg->subtalker_kv_heads;
+    int st_head_dim = cfg->subtalker_head_dim;
+    int st_kv_dim = st_kv_heads * st_head_dim;
+    int st_intermediate = cfg->subtalker_intermediate;
+    int st_layers = cfg->subtalker_layers;
+    float eps = cfg->talker_rms_norm_eps;
+    float scale = 1.0f / sqrtf((float)st_head_dim);
+    int copy_dim = project_src_dim;
+    if (copy_dim > st_hidden) copy_dim = st_hidden;
+
+    /* Copy input to destination via GPU copy (no CPU memcpy needed) */
+    if (project_src_buf != METAL_BUF_INVALID) {
+        metal_buf_t dst_buf = (ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID)
+                              ? ctx->mtl_x_norm : ctx->mtl_x;
+        metal_copy(dst_buf, project_src_buf, copy_dim);
+    }
+
+    /* Input projection if needed */
+    if (project_src_buf != METAL_BUF_INVALID &&
+        ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
+        metal_matvec_bf16(ctx->mtl_x, ctx->subtalker.mtl_input_proj, ctx->mtl_x_norm, st_hidden, project_src_dim);
+        if (ctx->subtalker.mtl_input_proj_bias != METAL_BUF_INVALID) {
+            metal_add_inplace(ctx->mtl_x, ctx->subtalker.mtl_input_proj_bias, st_hidden);
+        }
+    }
+
+    /* Transformer layers */
+    for (int sl = 0; sl < st_layers; sl++) {
+        qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[sl];
+        metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, l->mtl_input_norm, st_hidden, eps);
+        metal_qkv_matvec_bf16(ctx->mtl_q, ctx->mtl_k, ctx->mtl_v,
+                              l->mtl_wq, l->mtl_wk, l->mtl_wv,
+                              ctx->mtl_x_norm, st_heads, st_kv_heads, st_head_dim, st_hidden);
+        metal_qk_norm_rope_offset(ctx->mtl_q, ctx->mtl_k, l->mtl_q_norm, l->mtl_k_norm,
+                                   rope_cos_all, rope_sin_all, pos,
+                                   st_heads, st_kv_heads, st_head_dim, eps);
+        metal_kv_cache_store(ctx->mtl_sub_kv_k, ctx->mtl_sub_kv_v, ctx->mtl_k, ctx->mtl_v,
+                             sl, pos, st_kv_dim, ctx->mtl_sub_kv_max);
+        metal_attn_fused(ctx->mtl_attn_out, ctx->mtl_sub_scores, ctx->mtl_q,
+                         ctx->mtl_sub_kv_k, ctx->mtl_sub_kv_v,
+                         sl, pos + 1, ctx->mtl_sub_kv_max,
+                         st_heads, st_kv_heads, st_head_dim, scale);
+        metal_matvec_bf16(ctx->mtl_x_norm, l->mtl_wo, ctx->mtl_attn_out, st_hidden, st_heads * st_head_dim);
+        metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, st_hidden);
+        metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, l->mtl_post_attn_norm, st_hidden, eps);
+        if (l->mtl_gate_up_fused != METAL_BUF_INVALID) {
+            metal_swiglu_matvec_bf16(ctx->mtl_gate, l->mtl_gate_up_fused,
+                                     ctx->mtl_x_norm, st_intermediate, st_hidden);
+        } else {
+            metal_matvec_bf16(ctx->mtl_gate, l->mtl_gate, ctx->mtl_x_norm, st_intermediate, st_hidden);
+            metal_matvec_bf16(ctx->mtl_up, l->mtl_up, ctx->mtl_x_norm, st_intermediate, st_hidden);
+            metal_silu_inplace(ctx->mtl_gate, st_intermediate);
+            metal_mul_inplace(ctx->mtl_gate, ctx->mtl_up, st_intermediate);
+        }
+        metal_matvec_bf16(ctx->mtl_x_norm, l->mtl_down, ctx->mtl_gate, st_hidden, st_intermediate);
+        metal_add_inplace(ctx->mtl_x, ctx->mtl_x_norm, st_hidden);
+    }
+    metal_rms_norm_inplace(ctx->mtl_x, ctx->subtalker.mtl_norm, st_hidden, eps);
+    if (lm_head != METAL_BUF_INVALID) {
+        metal_matvec_bf16(ctx->mtl_logits, lm_head, ctx->mtl_x, st_vocab, st_hidden);
+    }
+    ctx->subtalker_kv_len = pos + 1;
 }
 
 static void subtalker_forward_step_metal(

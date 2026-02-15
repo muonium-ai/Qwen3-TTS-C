@@ -39,3 +39,5 @@ model/
 
 # Test outputs
 test/*.wav
+metal/output.wav
+.claude/settings.local.json

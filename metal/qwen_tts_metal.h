@@ -140,6 +140,12 @@ void metal_qk_norm_rope(metal_buf_t q, metal_buf_t k,
                         metal_buf_t cos_buf, metal_buf_t sin_buf,
                         int num_heads, int kv_heads, int head_dim, float eps);
 
+/* Same but with byte offset into cos/sin buffers (for pre-uploaded full RoPE table) */
+void metal_qk_norm_rope_offset(metal_buf_t q, metal_buf_t k,
+                                metal_buf_t q_norm_weight, metal_buf_t k_norm_weight,
+                                metal_buf_t cos_buf, metal_buf_t sin_buf, int cos_sin_offset,
+                                int num_heads, int kv_heads, int head_dim, float eps);
+
 /* KV cache write: store current k,v into [layer_idx, pos] */
 void metal_kv_cache_store(metal_buf_t kv_k, metal_buf_t kv_v,
                           metal_buf_t k, metal_buf_t v,
@@ -204,6 +210,15 @@ void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n);
 /* gate_out = silu(A_gate @ x) * (A_up @ x) where A is [2*intermediate, hidden] BF16 */
 void metal_swiglu_matvec_bf16(metal_buf_t out, metal_buf_t gate_up_bf16,
                               metal_buf_t x, int intermediate, int hidden);
+
+/* --- Fused subtalker ops --- */
+
+/* Read argmax token from GPU buffer, index into BF16 embedding table, output F32 embedding */
+void metal_embed_from_argmax_bf16(metal_buf_t out, metal_buf_t embeddings,
+                                  metal_buf_t token_buf, int dim);
+
+/* Copy src[0] (single int) to dst[idx] */
+void metal_scatter_int(metal_buf_t dst, metal_buf_t src, int idx);
 
 #ifdef __cplusplus
 }

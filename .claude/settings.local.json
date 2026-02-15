@@ -13,7 +13,11 @@
       "Bash(/Users/senthil/code/Qwen3-TTS-C/metal/qwen-tts-metal:*)",
       "Bash(/Users/senthil/code/Qwen3-TTS-C/qwen-tts:*)",
       "Bash(python3:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "Bash(grep:*)",
+      "Bash(QWEN_TTS_METAL_TALKER=1 ./qwen-tts-metal:*)",
+      "Bash(QWEN_TTS_METAL_TALKER=1 QWEN_TTS_METAL_CODEC_VOCODER=1 ./qwen-tts-metal:*)",
+      "Bash(QWEN_TTS_METAL_TALKER=1 QWEN_TTS_LAYER_TRACE=1 ./qwen-tts-metal:*)"
     ],
     "additionalDirectories": [
       "/Users/senthil/code/Qwen3-TTS-C/c"

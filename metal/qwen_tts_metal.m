@@ -61,6 +61,8 @@ typedef struct {
     id<MTLComputePipelineState> ps_bf16_to_f32;
     id<MTLComputePipelineState> ps_argmax_i32;
     id<MTLComputePipelineState> ps_swiglu_matvec_bf16;
+    id<MTLComputePipelineState> ps_embed_from_argmax_bf16;
+    id<MTLComputePipelineState> ps_scatter_int;
 } metal_state_t;
 
 static metal_state_t g_metal = {0};
@@ -230,6 +232,8 @@ int metal_init(void) {
         g_metal.ps_bf16_to_f32 = create_pipeline("kernel_bf16_to_f32_metal");
         g_metal.ps_argmax_i32 = create_pipeline("kernel_argmax_i32_metal");
         g_metal.ps_swiglu_matvec_bf16 = create_pipeline("kernel_swiglu_matvec_bf16_metal");
+        g_metal.ps_embed_from_argmax_bf16 = create_pipeline("kernel_embed_from_argmax_bf16_metal");
+        g_metal.ps_scatter_int = create_pipeline("kernel_scatter_int_metal");
 
         g_metal.buf_count = 0;
         g_metal.cmd_buf = nil;
@@ -658,14 +662,24 @@ void metal_qk_norm_rope(metal_buf_t q, metal_buf_t k,
                         metal_buf_t q_norm_weight, metal_buf_t k_norm_weight,
                         metal_buf_t cos_buf, metal_buf_t sin_buf,
                         int num_heads, int kv_heads, int head_dim, float eps) {
+    metal_qk_norm_rope_offset(q, k, q_norm_weight, k_norm_weight,
+                               cos_buf, sin_buf, 0,
+                               num_heads, kv_heads, head_dim, eps);
+}
+
+void metal_qk_norm_rope_offset(metal_buf_t q, metal_buf_t k,
+                                metal_buf_t q_norm_weight, metal_buf_t k_norm_weight,
+                                metal_buf_t cos_buf, metal_buf_t sin_buf, int cos_sin_offset,
+                                int num_heads, int kv_heads, int head_dim, float eps) {
     @autoreleasepool {
         id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_qk_norm_rope);
         [enc setBuffer:g_metal.buffers[q] offset:0 atIndex:0];
         [enc setBuffer:g_metal.buffers[k] offset:0 atIndex:1];
         [enc setBuffer:g_metal.buffers[q_norm_weight] offset:0 atIndex:2];
         [enc setBuffer:g_metal.buffers[k_norm_weight] offset:0 atIndex:3];
-        [enc setBuffer:g_metal.buffers[cos_buf] offset:0 atIndex:4];
-        [enc setBuffer:g_metal.buffers[sin_buf] offset:0 atIndex:5];
+        NSUInteger byte_off = (NSUInteger)cos_sin_offset * (NSUInteger)head_dim * sizeof(float);
+        [enc setBuffer:g_metal.buffers[cos_buf] offset:byte_off atIndex:4];
+        [enc setBuffer:g_metal.buffers[sin_buf] offset:byte_off atIndex:5];
         metal_params_t p = {.num_heads = num_heads, .kv_heads = kv_heads, .head_dim = head_dim, .eps = eps};
         [enc setBytes:&p length:sizeof(p) atIndex:6];
         NSUInteger tg = 128;
@@ -950,6 +964,31 @@ void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n) {
         }
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    }
+}
+
+void metal_embed_from_argmax_bf16(metal_buf_t out, metal_buf_t embeddings,
+                                  metal_buf_t token_buf, int dim) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_embed_from_argmax_bf16);
+        [enc setBuffer:g_metal.buffers[out] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[embeddings] offset:0 atIndex:1];
+        [enc setBuffer:g_metal.buffers[token_buf] offset:0 atIndex:2];
+        metal_params_t p = {.n = dim};
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        dispatch_1d(enc, g_metal.ps_embed_from_argmax_bf16, dim);
+    }
+}
+
+void metal_scatter_int(metal_buf_t dst, metal_buf_t src, int idx) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_scatter_int);
+        [enc setBuffer:g_metal.buffers[dst] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[src] offset:0 atIndex:1];
+        metal_params_t p = {.n = idx};
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
     }
 }
 
