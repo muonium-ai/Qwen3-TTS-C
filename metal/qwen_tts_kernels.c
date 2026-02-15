@@ -366,7 +366,18 @@ void kernel_apply_repetition_penalty(float *logits, const int *token_ids,
 
 int kernel_sample_top_k(const float *logits, int vocab_size, int top_k,
                         float top_p, float temperature, float *rng_state) {
-    if (temperature <= 0.0f) temperature = 1e-5f;
+    if (temperature <= 0.0f || (top_k == 1 && top_p >= 1.0f)) {
+        int best = 0;
+        float best_v = logits[0];
+        for (int i = 1; i < vocab_size; i++) {
+            if (logits[i] > best_v) {
+                best_v = logits[i];
+                best = i;
+            }
+        }
+        (void)rng_state;
+        return best;
+    }
 
     /*
      * Fast path for the common case in this project:

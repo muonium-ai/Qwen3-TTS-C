@@ -294,7 +294,8 @@ static int should_use_metal_subtalker(void) {
 
 static void subtalker_forward_step_metal(
     qwen_tts_ctx_t *ctx,
-    const float *input_vec,
+    const float *project_src,
+    int project_src_dim,
     int pos,
     metal_buf_t lm_head,
     int st_vocab,
@@ -311,13 +312,35 @@ static void subtalker_forward_step_metal(
     float eps = cfg->talker_rms_norm_eps;
     float scale = 1.0f / sqrtf((float)st_head_dim);
 
-    metal_buf_write(ctx->mtl_x, input_vec, st_hidden * sizeof(float));
+    if (project_src) {
+        if (ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
+            if (project_src_dim < 0) project_src_dim = 0;
+            if (project_src_dim > st_hidden) project_src_dim = st_hidden;
+            metal_buf_write(ctx->mtl_x_norm, project_src, (size_t)project_src_dim * sizeof(float));
+        } else {
+            float *x_ptr = (float *)metal_buf_contents(ctx->mtl_x);
+            int copy_dim = project_src_dim;
+            if (copy_dim < 0) copy_dim = 0;
+            if (copy_dim > st_hidden) copy_dim = st_hidden;
+            memcpy(x_ptr, project_src, (size_t)copy_dim * sizeof(float));
+            if (copy_dim < st_hidden) {
+                memset(x_ptr + copy_dim, 0, (size_t)(st_hidden - copy_dim) * sizeof(float));
+            }
+        }
+    }
+
     metal_buf_write(ctx->mtl_rope_cos, ctx->st_rope_cos + (size_t)pos * st_head_dim,
                     st_head_dim * sizeof(float));
     metal_buf_write(ctx->mtl_rope_sin, ctx->st_rope_sin + (size_t)pos * st_head_dim,
                     st_head_dim * sizeof(float));
 
     metal_begin();
+    if (project_src && ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
+        metal_matvec_bf16(ctx->mtl_x, ctx->subtalker.mtl_input_proj, ctx->mtl_x_norm, st_hidden, project_src_dim);
+        if (ctx->subtalker.mtl_input_proj_bias != METAL_BUF_INVALID) {
+            metal_add_inplace(ctx->mtl_x, ctx->subtalker.mtl_input_proj_bias, st_hidden);
+        }
+    }
     for (int sl = 0; sl < st_layers; sl++) {
         qwen_tts_subtalker_layer_t *l = &ctx->subtalker.layers[sl];
         metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, l->mtl_input_norm, st_hidden, eps);
@@ -1148,14 +1171,13 @@ void qwen_tts_subtalker_generate(
     if (use_metal_subtalker) {
         float rng = 42.0f;
 
-        ST_PROJECT_INPUT(proj_hidden, talker_hidden, talker_hidden_dim);
-        subtalker_forward_step_metal(ctx, proj_hidden, 0, METAL_BUF_INVALID, st_vocab, NULL);
+        subtalker_forward_step_metal(ctx, talker_hidden, talker_hidden_dim, 0, METAL_BUF_INVALID, st_vocab, NULL);
 
         if (num_groups > 1) {
             const uint16_t *emb = ctx->talker.codec_embedding_bf16;
             kernel_bf16_to_f32(embed_buf, emb + (size_t)first_code * talker_hidden_dim, talker_hidden_dim);
-            ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
-            subtalker_forward_step_metal(ctx, proj_hidden, 1, ctx->subtalker.mtl_lm_heads[0], st_vocab, logits_buf);
+            subtalker_forward_step_metal(ctx, embed_buf, talker_hidden_dim, 1,
+                                         ctx->subtalker.mtl_lm_heads[0], st_vocab, logits_buf);
             out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                                ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
         }
@@ -1163,8 +1185,8 @@ void qwen_tts_subtalker_generate(
         for (int g = 2; g < num_groups; g++) {
             kernel_bf16_to_f32(embed_buf, ctx->subtalker.codec_embeddings_bf16[g - 2] +
                                (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
-            ST_PROJECT_INPUT(proj_hidden, embed_buf, talker_hidden_dim);
-            subtalker_forward_step_metal(ctx, proj_hidden, g, ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, logits_buf);
+            subtalker_forward_step_metal(ctx, embed_buf, talker_hidden_dim, g,
+                                         ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, logits_buf);
             out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                                ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
         }
