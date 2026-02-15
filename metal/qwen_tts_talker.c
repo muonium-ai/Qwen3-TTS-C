@@ -214,6 +214,8 @@ static int ensure_talker_metal_kv_cache(qwen_tts_ctx_t *ctx, int prefill_len) {
 static int ensure_subtalker_metal_scratch(qwen_tts_ctx_t *ctx) {
     qwen_tts_config_t *cfg = &ctx->config;
     int st_hidden = cfg->subtalker_hidden;
+    int talker_hidden = cfg->talker_hidden;
+    int embed_dim = talker_hidden > st_hidden ? talker_hidden : st_hidden;
     int st_heads = cfg->subtalker_heads;
     int st_kv_heads = cfg->subtalker_kv_heads;
     int st_head_dim = cfg->subtalker_head_dim;
@@ -232,13 +234,16 @@ static int ensure_subtalker_metal_scratch(qwen_tts_ctx_t *ctx) {
     ctx->mtl_logits = metal_buf_ensure(ctx->mtl_logits, st_vocab * sizeof(float));
     ctx->mtl_rope_cos = metal_buf_ensure(ctx->mtl_rope_cos, st_head_dim * sizeof(float));
     ctx->mtl_rope_sin = metal_buf_ensure(ctx->mtl_rope_sin, st_head_dim * sizeof(float));
+    ctx->mtl_sub_embed = metal_buf_ensure(ctx->mtl_sub_embed, embed_dim * sizeof(float));
+    ctx->mtl_sub_token = metal_buf_ensure(ctx->mtl_sub_token, sizeof(int));
 
     if (ctx->mtl_x == METAL_BUF_INVALID || ctx->mtl_x_norm == METAL_BUF_INVALID ||
         ctx->mtl_q == METAL_BUF_INVALID || ctx->mtl_k == METAL_BUF_INVALID ||
         ctx->mtl_v == METAL_BUF_INVALID || ctx->mtl_attn_out == METAL_BUF_INVALID ||
         ctx->mtl_gate == METAL_BUF_INVALID || ctx->mtl_up == METAL_BUF_INVALID ||
         ctx->mtl_logits == METAL_BUF_INVALID ||
-        ctx->mtl_rope_cos == METAL_BUF_INVALID || ctx->mtl_rope_sin == METAL_BUF_INVALID) {
+        ctx->mtl_rope_cos == METAL_BUF_INVALID || ctx->mtl_rope_sin == METAL_BUF_INVALID ||
+        ctx->mtl_sub_embed == METAL_BUF_INVALID || ctx->mtl_sub_token == METAL_BUF_INVALID) {
         return -1;
     }
     return 0;
@@ -295,11 +300,13 @@ static int should_use_metal_subtalker(void) {
 static void subtalker_forward_step_metal(
     qwen_tts_ctx_t *ctx,
     const float *project_src,
+    metal_buf_t project_src_buf,
     int project_src_dim,
     int pos,
     metal_buf_t lm_head,
     int st_vocab,
-    float *logits_out
+    float *logits_out,
+    int sync_after
 ) {
     qwen_tts_config_t *cfg = &ctx->config;
     int st_hidden = cfg->subtalker_hidden;
@@ -311,20 +318,27 @@ static void subtalker_forward_step_metal(
     int st_layers = cfg->subtalker_layers;
     float eps = cfg->talker_rms_norm_eps;
     float scale = 1.0f / sqrtf((float)st_head_dim);
+    if (project_src_dim < 0) project_src_dim = 0;
+    if (project_src_dim > st_hidden) project_src_dim = st_hidden;
 
-    if (project_src) {
+    if (project_src || project_src_buf != METAL_BUF_INVALID) {
+        int copy_dim = project_src_dim;
+        float *dst_ptr = NULL;
+        const float *src_ptr = project_src;
+
         if (ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
-            if (project_src_dim < 0) project_src_dim = 0;
-            if (project_src_dim > st_hidden) project_src_dim = st_hidden;
-            metal_buf_write(ctx->mtl_x_norm, project_src, (size_t)project_src_dim * sizeof(float));
+            dst_ptr = (float *)metal_buf_contents(ctx->mtl_x_norm);
         } else {
-            float *x_ptr = (float *)metal_buf_contents(ctx->mtl_x);
-            int copy_dim = project_src_dim;
-            if (copy_dim < 0) copy_dim = 0;
-            if (copy_dim > st_hidden) copy_dim = st_hidden;
-            memcpy(x_ptr, project_src, (size_t)copy_dim * sizeof(float));
+            dst_ptr = (float *)metal_buf_contents(ctx->mtl_x);
+        }
+
+        if (project_src_buf != METAL_BUF_INVALID) {
+            src_ptr = (const float *)metal_buf_contents(project_src_buf);
+        }
+        if (dst_ptr && src_ptr && copy_dim > 0) {
+            memcpy(dst_ptr, src_ptr, (size_t)copy_dim * sizeof(float));
             if (copy_dim < st_hidden) {
-                memset(x_ptr + copy_dim, 0, (size_t)(st_hidden - copy_dim) * sizeof(float));
+                memset(dst_ptr + copy_dim, 0, (size_t)(st_hidden - copy_dim) * sizeof(float));
             }
         }
     }
@@ -334,8 +348,8 @@ static void subtalker_forward_step_metal(
     metal_buf_write(ctx->mtl_rope_sin, ctx->st_rope_sin + (size_t)pos * st_head_dim,
                     st_head_dim * sizeof(float));
 
-    metal_begin();
-    if (project_src && ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
+    if ((project_src || project_src_buf != METAL_BUF_INVALID) &&
+        ctx->subtalker.mtl_input_proj != METAL_BUF_INVALID) {
         metal_matvec_bf16(ctx->mtl_x, ctx->subtalker.mtl_input_proj, ctx->mtl_x_norm, st_hidden, project_src_dim);
         if (ctx->subtalker.mtl_input_proj_bias != METAL_BUF_INVALID) {
             metal_add_inplace(ctx->mtl_x, ctx->subtalker.mtl_input_proj_bias, st_hidden);
@@ -376,7 +390,9 @@ static void subtalker_forward_step_metal(
     if (lm_head != METAL_BUF_INVALID) {
         metal_matvec_bf16(ctx->mtl_logits, lm_head, ctx->mtl_x, st_vocab, st_hidden);
     }
-    metal_sync();
+    if (sync_after || (lm_head != METAL_BUF_INVALID && logits_out)) {
+        metal_sync();
+    }
 
     if (lm_head != METAL_BUF_INVALID && logits_out) {
         memcpy(logits_out, metal_buf_contents(ctx->mtl_logits), (size_t)st_vocab * sizeof(float));
@@ -1169,26 +1185,49 @@ void qwen_tts_subtalker_generate(
         }
     }
     if (use_metal_subtalker) {
-        float rng = 42.0f;
+        float rng = (float)ctx->sample_seed;
+        int deterministic_subtalker = (ctx->subtalker_temperature <= 0.0f) ||
+                                      (ctx->subtalker_top_k <= 1 && ctx->subtalker_top_p >= 1.0f);
 
-        subtalker_forward_step_metal(ctx, talker_hidden, talker_hidden_dim, 0, METAL_BUF_INVALID, st_vocab, NULL);
+        subtalker_forward_step_metal(ctx, talker_hidden, METAL_BUF_INVALID, talker_hidden_dim, 0,
+                                     METAL_BUF_INVALID, st_vocab, NULL, 1);
 
         if (num_groups > 1) {
-            const uint16_t *emb = ctx->talker.codec_embedding_bf16;
-            kernel_bf16_to_f32(embed_buf, emb + (size_t)first_code * talker_hidden_dim, talker_hidden_dim);
-            subtalker_forward_step_metal(ctx, embed_buf, talker_hidden_dim, 1,
-                                         ctx->subtalker.mtl_lm_heads[0], st_vocab, logits_buf);
-            out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
-                                               ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
+            if (deterministic_subtalker) {
+                metal_bf16_row_to_f32(ctx->mtl_sub_embed, ctx->talker.mtl_codec_embedding,
+                                      first_code, talker_hidden_dim);
+                subtalker_forward_step_metal(ctx, NULL, ctx->mtl_sub_embed, talker_hidden_dim, 1,
+                                             ctx->subtalker.mtl_lm_heads[0], st_vocab, NULL, 0);
+                metal_argmax_i32(ctx->mtl_sub_token, ctx->mtl_logits, st_vocab);
+                metal_sync();
+                out_codes[1] = ((int *)metal_buf_contents(ctx->mtl_sub_token))[0];
+            } else {
+                const uint16_t *emb = ctx->talker.codec_embedding_bf16;
+                kernel_bf16_to_f32(embed_buf, emb + (size_t)first_code * talker_hidden_dim, talker_hidden_dim);
+                subtalker_forward_step_metal(ctx, embed_buf, METAL_BUF_INVALID, talker_hidden_dim, 1,
+                                             ctx->subtalker.mtl_lm_heads[0], st_vocab, logits_buf, 1);
+                out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
+                                                   ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
+            }
         }
 
         for (int g = 2; g < num_groups; g++) {
-            kernel_bf16_to_f32(embed_buf, ctx->subtalker.codec_embeddings_bf16[g - 2] +
-                               (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
-            subtalker_forward_step_metal(ctx, embed_buf, talker_hidden_dim, g,
-                                         ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, logits_buf);
-            out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
-                                               ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
+            if (deterministic_subtalker) {
+                metal_bf16_row_to_f32(ctx->mtl_sub_embed, ctx->subtalker.mtl_codec_embeddings[g - 2],
+                                      out_codes[g - 1], talker_hidden_dim);
+                subtalker_forward_step_metal(ctx, NULL, ctx->mtl_sub_embed, talker_hidden_dim, g,
+                                             ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, NULL, 0);
+                metal_argmax_i32(ctx->mtl_sub_token, ctx->mtl_logits, st_vocab);
+                metal_sync();
+                out_codes[g] = ((int *)metal_buf_contents(ctx->mtl_sub_token))[0];
+            } else {
+                kernel_bf16_to_f32(embed_buf, ctx->subtalker.codec_embeddings_bf16[g - 2] +
+                                   (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
+                subtalker_forward_step_metal(ctx, embed_buf, METAL_BUF_INVALID, talker_hidden_dim, g,
+                                             ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, logits_buf, 1);
+                out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
+                                                   ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
+            }
         }
 
         memcpy(x, metal_buf_contents(ctx->mtl_x), st_hidden * sizeof(float));
@@ -1210,7 +1249,7 @@ void qwen_tts_subtalker_generate(
 
     /* Generate group 1 from lm_head[0] */
     kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[0], x, st_vocab, st_hidden);
-    float rng = 42.0f;
+    float rng = (float)ctx->sample_seed;
     out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                         ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
 

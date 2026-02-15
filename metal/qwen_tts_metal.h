@@ -196,6 +196,8 @@ void metal_transposed_conv1d(metal_buf_t out, metal_buf_t input, metal_buf_t wei
 /* --- Conversion --- */
 
 void metal_bf16_to_f32(metal_buf_t out, metal_buf_t in_buf, int n);
+void metal_bf16_row_to_f32(metal_buf_t out, metal_buf_t in_buf, int row_idx, int row_size);
+void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n);
 
 /* --- SwiGLU fused --- */
 

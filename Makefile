@@ -43,8 +43,12 @@ WASM_WASI_FLAGS = -O3 -DNDEBUG -s STANDALONE_WASM=1 -s PURE_WASI=1 -s WASMFS=1 \
 	-s INITIAL_MEMORY=268435456
 
 # Benchmark configuration (override in CI/environment)
-# Prefer python3.11 when available (commonly where torch is installed).
-PYTHON           ?= $(shell command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || echo python3)
+# Use uv-managed virtualenv to avoid interpreter drift across commands.
+UV               ?= uv
+PYTHON_VERSION   ?= 3.11
+VENV_DIR         ?= .venv
+PYTHON_BASE      ?= $(shell command -v python$(PYTHON_VERSION) 2>/dev/null || command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || echo python3)
+PYTHON           ?= $(if $(wildcard $(VENV_DIR)/bin/python),$(VENV_DIR)/bin/python,$(PYTHON_BASE))
 BENCH_SCRIPT     ?= scripts/benchmark_py_vs_c.py
 BENCH_ALL_SCRIPT ?= scripts/benchmark_all.py
 EOS_PARITY_SCRIPT ?= scripts/validate_eos_parity.py
@@ -308,7 +312,12 @@ benchmark-gate: benchmark
 
 .PHONY: setup-benchmark
 setup-benchmark:
-	$(PYTHON) -m pip install -e .
+	@command -v $(UV) >/dev/null 2>&1 || (echo "Error: uv not found"; exit 1)
+	@command -v $(PYTHON_BASE) >/dev/null 2>&1 || \
+		(echo "Error: base Python not found for version $(PYTHON_VERSION)"; exit 1)
+	$(UV) venv --python "$(PYTHON_BASE)" --system-site-packages --clear "$(VENV_DIR)"
+	$(PYTHON) -m pip install -e . --no-deps
+	$(PYTHON) -c "import torch, transformers; print('setup-benchmark ok:', torch.__version__, transformers.__version__)"
 
 .PHONY: validate-eos
 validate-eos: all
@@ -367,7 +376,7 @@ help:
 	@echo "  make wasm     Build browser-loadable WASM artifacts (Emscripten required)"
 	@echo "  make wasm-prepare-tokenizer Ensure $(WASM_MODEL_DIR)/tokenizer.json for browser tokenizer"
 	@echo "  make wasm-setup Install/activate vendored emsdk toolchain ($(EMSDK_VERSION))"
-	@echo "  make setup-benchmark Install Python benchmark dependencies into $(PYTHON)"
+	@echo "  make setup-benchmark Install benchmark dependencies into uv Python $(PYTHON_VERSION)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
 	@echo "  make benchmark-all Run Python vs C vs Metal benchmark with default settings"
 	@echo "  make benchmark-gate Run benchmark with normalized-metric quality gates (CI-friendly)"

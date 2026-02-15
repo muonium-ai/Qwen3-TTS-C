@@ -46,6 +46,8 @@ static void usage(const char *prog) {
         "  --top-p <f>                  Talker top-P (default: 1.0)\n"
         "  --repetition-penalty <f>     Repetition penalty (default: 1.05)\n"
         "  --max-tokens <n>             Max codec tokens to generate (default: 4096)\n"
+        "  --fixed-codec-tokens <n>     Generate exactly n codec tokens (ignore EOS before n)\n"
+        "  --seed <n>                   Sampling RNG seed (default: 42)\n"
         "  --subtalker-temperature <f>  Sub-talker temperature (default: 0.9)\n"
         "  --subtalker-top-k <n>        Sub-talker top-K (default: 50)\n"
         "  --subtalker-top-p <f>        Sub-talker top-P (default: 1.0)\n"
@@ -116,6 +118,8 @@ int main(int argc, char **argv) {
     float subtalker_top_p = -1;
     float repetition_penalty = -1;
     int max_tokens = -1;
+    int fixed_codec_tokens = -1;
+    int seed = -1;
     int benchmark_runs = 1;
     int benchmark_warmup = 0;
 
@@ -145,6 +149,10 @@ int main(int argc, char **argv) {
             repetition_penalty = strtof(argv[++i], NULL);
         } else if (strcmp(argv[i], "--max-tokens") == 0 && i + 1 < argc) {
             max_tokens = (int)strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--fixed-codec-tokens") == 0 && i + 1 < argc) {
+            fixed_codec_tokens = (int)strtol(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--seed") == 0 && i + 1 < argc) {
+            seed = (int)strtol(argv[++i], NULL, 10);
         } else if (strcmp(argv[i], "--subtalker-temperature") == 0 && i + 1 < argc) {
             subtalker_temperature = strtof(argv[++i], NULL);
         } else if (strcmp(argv[i], "--subtalker-top-k") == 0 && i + 1 < argc) {
@@ -215,6 +223,8 @@ int main(int argc, char **argv) {
     if (subtalker_top_p >= 0)      ctx->subtalker_top_p = subtalker_top_p;
     if (repetition_penalty >= 0)   ctx->repetition_penalty = repetition_penalty;
     if (max_tokens >= 0)           ctx->max_new_tokens = max_tokens;
+    if (fixed_codec_tokens >= 0)   ctx->fixed_codec_tokens = fixed_codec_tokens;
+    if (seed >= 0)                 ctx->sample_seed = seed;
 
     /* Set progress callback for non-verbose mode */
     if (verbose == 0) {
@@ -225,6 +235,10 @@ int main(int argc, char **argv) {
     if (verbose >= 1) {
         fprintf(stderr, "Generation params: temp=%.2f top_k=%d top_p=%.2f rep_penalty=%.2f max_tokens=%d\n",
                 ctx->temperature, ctx->top_k, ctx->top_p, ctx->repetition_penalty, ctx->max_new_tokens);
+        if (ctx->fixed_codec_tokens > 0) {
+            fprintf(stderr, "Fixed codec tokens: %d\n", ctx->fixed_codec_tokens);
+        }
+        fprintf(stderr, "Seed: %d\n", ctx->sample_seed);
         if (speaker) fprintf(stderr, "Speaker: %s\n", speaker);
         if (language) fprintf(stderr, "Language: %s\n", language);
     }

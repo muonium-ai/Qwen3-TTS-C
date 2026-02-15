@@ -58,6 +58,7 @@ typedef struct {
     id<MTLComputePipelineState> ps_causal_conv1d;
     id<MTLComputePipelineState> ps_transposed_conv1d;
     id<MTLComputePipelineState> ps_bf16_to_f32;
+    id<MTLComputePipelineState> ps_argmax_i32;
     id<MTLComputePipelineState> ps_swiglu_matvec_bf16;
 } metal_state_t;
 
@@ -226,6 +227,7 @@ int metal_init(void) {
         g_metal.ps_causal_conv1d = create_pipeline("kernel_causal_conv1d_metal");
         g_metal.ps_transposed_conv1d = create_pipeline("kernel_transposed_conv1d_metal");
         g_metal.ps_bf16_to_f32 = create_pipeline("kernel_bf16_to_f32_metal");
+        g_metal.ps_argmax_i32 = create_pipeline("kernel_argmax_i32_metal");
         g_metal.ps_swiglu_matvec_bf16 = create_pipeline("kernel_swiglu_matvec_bf16_metal");
 
         g_metal.buf_count = 0;
@@ -479,6 +481,8 @@ typedef struct {
     int seq_len;
     int layer_idx;
     int pos;
+    int row_idx;
+    int row_size;
 } metal_params_t;
 
 void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
@@ -893,6 +897,37 @@ void metal_bf16_to_f32(metal_buf_t out, metal_buf_t in_buf, int n) {
         metal_params_t p = {.n = n};
         [enc setBytes:&p length:sizeof(p) atIndex:2];
         dispatch_1d(enc, g_metal.ps_bf16_to_f32, n);
+    }
+}
+
+void metal_bf16_row_to_f32(metal_buf_t out, metal_buf_t in_buf, int row_idx, int row_size) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_bf16_to_f32);
+        NSUInteger row_off = (NSUInteger)row_idx * (NSUInteger)row_size * sizeof(uint16_t);
+        [enc setBuffer:g_metal.buffers[out] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[in_buf] offset:row_off atIndex:1];
+        metal_params_t p = {.n = row_size};
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        dispatch_1d(enc, g_metal.ps_bf16_to_f32, row_size);
+    }
+}
+
+void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n) {
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_argmax_i32);
+        [enc setBuffer:g_metal.buffers[out_idx] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:1];
+        metal_params_t p = {.n = n};
+        [enc setBytes:&p length:sizeof(p) atIndex:2];
+        NSUInteger tg = 256;
+        if ((NSUInteger)n < tg) {
+            tg = 1;
+            while ((int)tg < n) tg <<= 1;
+            if (tg > 256) tg = 256;
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+        [enc endEncoding];
     }
 }
 

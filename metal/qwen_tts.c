@@ -1005,6 +1005,8 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     ctx->mtl_sub_kv_k = METAL_BUF_INVALID;
     ctx->mtl_sub_kv_v = METAL_BUF_INVALID;
     ctx->mtl_sub_kv_max = 0;
+    ctx->mtl_sub_embed = METAL_BUF_INVALID;
+    ctx->mtl_sub_token = METAL_BUF_INVALID;
 #endif
 
     strncpy(ctx->model_dir, model_dir, sizeof(ctx->model_dir) - 1);
@@ -1018,6 +1020,8 @@ qwen_tts_ctx_t *qwen_tts_load(const char *model_dir) {
     ctx->subtalker_top_p = 1.0f;
     ctx->repetition_penalty = 1.05f;
     ctx->max_new_tokens = 4096;
+    ctx->fixed_codec_tokens = 0;
+    ctx->sample_seed = 42;
 
     /* Load config */
     if (load_config(ctx) != 0) {
@@ -1591,7 +1595,8 @@ float *qwen_tts_generate(
     free(input_embeds);
 
     /* ---- Autoregressive generation ---- */
-    int max_tokens = ctx->max_new_tokens;
+    int fixed_tokens = ctx->fixed_codec_tokens > 0 ? ctx->fixed_codec_tokens : 0;
+    int max_tokens = fixed_tokens > 0 ? fixed_tokens : ctx->max_new_tokens;
     int *all_codes = (int *)calloc((size_t)max_tokens * num_groups, sizeof(int));
     int *generated_tokens = (int *)calloc(max_tokens, sizeof(int));
     int n_generated = 0;
@@ -1601,7 +1606,7 @@ float *qwen_tts_generate(
     float *logits = (float *)malloc(cfg->talker_vocab_size * sizeof(float));
     float *next_embed = (float *)malloc(hidden * sizeof(float));
     float *emb_tmp = (float *)malloc(hidden * sizeof(float));
-    float rng_state = 42.0f;
+    float rng_state = (float)ctx->sample_seed;
 
     /* Suppress tokens: [vocab-1024, vocab) except EOS */
     int suppress_start = cfg->talker_vocab_size - 1024;
@@ -1646,8 +1651,16 @@ float *qwen_tts_generate(
         int token = kernel_sample_top_k(logits, cfg->talker_vocab_size, ctx->top_k,
                                          ctx->top_p, ctx->temperature, &rng_state);
 
+        if (fixed_tokens > 0 && token == cfg->codec_eos_id && n_generated < fixed_tokens) {
+            float eos_logit = logits[cfg->codec_eos_id];
+            logits[cfg->codec_eos_id] = -1e9f;
+            token = kernel_sample_top_k(logits, cfg->talker_vocab_size, ctx->top_k,
+                                        ctx->top_p, ctx->temperature, &rng_state);
+            logits[cfg->codec_eos_id] = eos_logit;
+        }
+
         /* Check for EOS */
-        if (token == cfg->codec_eos_id) {
+        if (fixed_tokens == 0 && token == cfg->codec_eos_id) {
             stop_reason = 1;
             stop_step = step;
             if (qwen_tts_verbose >= 1)

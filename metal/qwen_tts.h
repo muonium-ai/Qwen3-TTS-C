@@ -482,6 +482,8 @@ typedef struct {
     float subtalker_top_p;
     float repetition_penalty;
     int max_new_tokens;
+    int fixed_codec_tokens;
+    int sample_seed;
 
     /* Progress callback */
     qwen_tts_progress_cb progress_cb;
@@ -504,6 +506,8 @@ typedef struct {
     int mtl_sub_scores;
     int mtl_sub_kv_k, mtl_sub_kv_v;
     int mtl_sub_kv_max;
+    int mtl_sub_embed;
+    int mtl_sub_token;
 #endif
 } qwen_tts_ctx_t;
 

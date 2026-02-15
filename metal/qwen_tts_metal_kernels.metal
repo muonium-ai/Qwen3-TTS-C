@@ -43,6 +43,8 @@ struct Params {
     int seq_len;
     int layer_idx;
     int pos;
+    int row_idx;
+    int row_size;
 };
 
 /* BF16 to F32 conversion */
@@ -887,6 +889,57 @@ kernel void kernel_bf16_to_f32_metal(
 {
     if ((int)gid >= p.n) return;
     out[gid] = bf16_to_f32(in[gid]);
+}
+
+/* ========================================================================
+ * Argmax over float vector
+ * ======================================================================== */
+
+kernel void kernel_argmax_i32_metal(
+    device int *out_idx [[buffer(0)]],
+    const device float *x [[buffer(1)]],
+    constant Params &p [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    threadgroup float shared_val[256];
+    threadgroup int shared_idx[256];
+
+    if (p.n <= 0) {
+        if (tid == 0) out_idx[0] = 0;
+        return;
+    }
+
+    float best_val = -INFINITY;
+    int best_idx = 0;
+    for (int i = (int)tid; i < p.n; i += (int)tg_size) {
+        float v = x[i];
+        if (v > best_val || (v == best_val && i < best_idx)) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    shared_val[tid] = best_val;
+    shared_idx[tid] = best_idx;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            float v0 = shared_val[tid];
+            int i0 = shared_idx[tid];
+            float v1 = shared_val[tid + s];
+            int i1 = shared_idx[tid + s];
+            if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                shared_val[tid] = v1;
+                shared_idx[tid] = i1;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        out_idx[0] = shared_idx[0];
+    }
 }
 
 /* ========================================================================

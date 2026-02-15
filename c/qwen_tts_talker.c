@@ -715,7 +715,7 @@ void qwen_tts_subtalker_generate(
 
     /* Generate group 1 from lm_head[0] */
     kernel_matvec_bf16(logits_buf, ctx->subtalker.lm_heads_bf16[0], x, st_vocab, st_hidden);
-    float rng = 42.0f;
+    float rng = (float)ctx->sample_seed;
     out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
                                         ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
 

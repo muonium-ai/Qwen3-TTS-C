@@ -426,6 +426,8 @@ typedef struct {
     float subtalker_top_p;
     float repetition_penalty;
     int max_new_tokens;
+    int fixed_codec_tokens;
+    int sample_seed;
 
     /* Progress callback */
     qwen_tts_progress_cb progress_cb;

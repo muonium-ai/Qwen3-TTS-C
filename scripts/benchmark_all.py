@@ -15,6 +15,7 @@ import argparse
 import json
 import os
 import platform
+import random
 import re
 import statistics
 import subprocess
@@ -164,7 +165,10 @@ def build_c_cmd(
         "--subtalker-top-k", str(args.subtalker_top_k),
         "--subtalker-top-p", str(args.subtalker_top_p),
         "--max-tokens", str(args.max_new_tokens),
+        "--seed", str(args.seed),
     ]
+    if args.fixed_codec_tokens > 0:
+        cmd += ["--fixed-codec-tokens", str(args.fixed_codec_tokens)]
     if verbose:
         cmd.append("-v")
     if bench_runs is not None:
@@ -325,8 +329,19 @@ def bench_python(
         subtalker_temperature=args.subtalker_temperature if args.subtalker_temperature > 0.0 else 1.0,
         max_new_tokens=args.max_new_tokens,
     )
+    if args.fixed_codec_tokens > 0:
+        gen_kwargs["min_new_tokens"] = args.fixed_codec_tokens
+        gen_kwargs["max_new_tokens"] = args.fixed_codec_tokens
+
+    def set_seed(seed: int) -> None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     def run_once() -> RunResult:
+        set_seed(args.seed)
         start = time.perf_counter()
         talker_codes_list, _ = model.model.generate(
             input_ids=input_ids,
@@ -344,7 +359,8 @@ def bench_python(
         audio_sec = float(len(audio)) / float(sr)
         codes = talker_codes_list[0]
         codec_tokens = int(codes.shape[0])
-        stop = "max_tokens" if codec_tokens >= args.max_new_tokens else "eos"
+        token_limit = args.fixed_codec_tokens if args.fixed_codec_tokens > 0 else args.max_new_tokens
+        stop = "max_tokens" if codec_tokens >= token_limit else "eos"
         return RunResult(
             elapsed_ms=elapsed_ms,
             audio_sec=audio_sec,
@@ -459,6 +475,10 @@ def main() -> int:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--fixed-codec-tokens", type=int, default=0,
+                        help="Force exactly N generated codec tokens (0 disables)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Sampling RNG seed for Python/C/Metal")
 
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-k", type=int, default=50)
@@ -508,6 +528,9 @@ def main() -> int:
     print(f"[setup] speaker: {args.speaker}, language: {args.language}")
     print(f"[setup] runs: {args.runs}, warmup: {args.warmup}")
     print(f"[setup] max_new_tokens: {args.max_new_tokens}")
+    if args.fixed_codec_tokens > 0:
+        print(f"[setup] fixed_codec_tokens: {args.fixed_codec_tokens}")
+    print(f"[setup] seed: {args.seed}")
     print()
 
     summaries: dict[str, dict[str, Any]] = {}
@@ -525,6 +548,8 @@ def main() -> int:
             "runs": args.runs,
             "warmup": args.warmup,
             "max_new_tokens": args.max_new_tokens,
+            "fixed_codec_tokens": args.fixed_codec_tokens,
+            "seed": args.seed,
             "temperature": args.temperature,
             "top_k": args.top_k,
             "persistent": args.persistent,
