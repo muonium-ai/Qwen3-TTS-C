@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import platform
 import re
 import statistics
 import subprocess
@@ -52,6 +53,39 @@ class RunResult:
         if self.codec_tokens and self.codec_tokens > 0 and self.elapsed_ms > 0:
             return float(self.codec_tokens) / (self.elapsed_ms / 1000.0)
         return None
+
+
+def detect_python_runtime() -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "executable": sys.executable,
+        "version": sys.version.split()[0],
+        "implementation": platform.python_implementation(),
+    }
+
+    env_keys = [
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "PYTORCH_ENABLE_MPS_FALLBACK",
+    ]
+    out["env"] = {k: v for k, v in ((k, os.getenv(k)) for k in env_keys) if v is not None}
+
+    versions: dict[str, str] = {}
+    try:
+        from importlib import metadata as importlib_metadata
+    except Exception:
+        importlib_metadata = None
+
+    if importlib_metadata is not None:
+        for pkg in ("torch", "transformers", "accelerate", "numpy", "qwen-tts"):
+            try:
+                versions[pkg] = importlib_metadata.version(pkg)
+            except Exception:
+                pass
+    out["package_versions"] = versions
+
+    return out
 
 
 def wav_duration(path: Path) -> float:
@@ -117,10 +151,11 @@ def build_c_cmd(
     out_wav: Path,
     bench_runs: int | None = None,
     bench_warmup: int | None = None,
+    verbose: bool = True,
 ) -> list[str]:
     cmd = [
         str(binary), "-d", model_dir, "-t", token_ids,
-        "-o", str(out_wav), "-v", "-s", speaker, "-l", language,
+        "-o", str(out_wav), "-s", speaker, "-l", language,
         "--temperature", str(args.temperature),
         "--top-k", str(args.top_k),
         "--top-p", str(args.top_p),
@@ -130,6 +165,8 @@ def build_c_cmd(
         "--subtalker-top-p", str(args.subtalker_top_p),
         "--max-tokens", str(args.max_new_tokens),
     ]
+    if verbose:
+        cmd.append("-v")
     if bench_runs is not None:
         cmd += ["--benchmark-runs", str(bench_runs)]
     if bench_warmup is not None:
@@ -145,10 +182,11 @@ def run_c_binary(
     language: str,
     args: argparse.Namespace,
     out_wav: Path,
+    env: dict[str, str] | None = None,
 ) -> RunResult:
-    cmd = build_c_cmd(binary, model_dir, token_ids, speaker, language, args, out_wav)
+    cmd = build_c_cmd(binary, model_dir, token_ids, speaker, language, args, out_wav, verbose=True)
     start = time.perf_counter()
-    proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+    proc = subprocess.run(cmd, check=True, text=True, capture_output=True, env=env)
     elapsed_ms = (time.perf_counter() - start) * 1000.0
     audio_sec = wav_duration(out_wav)
     internal_ms, codec_tokens, stop = parse_c_stderr(proc.stderr)
@@ -171,13 +209,19 @@ def bench_binary(
     args: argparse.Namespace,
     out_dir: Path,
 ) -> list[RunResult]:
+    env = os.environ.copy()
+    if label == "metal":
+        env.setdefault("QWEN_TTS_ENABLE_METAL", "1")
+        env.setdefault("QWEN_TTS_METAL_TALKER", "1")
+        env.setdefault("QWEN_TTS_METAL_SUBTALKER", "1")
+
     if args.persistent:
         wav_path = out_dir / f"{label}_output.wav"
         cmd = build_c_cmd(
             binary, model_dir, token_ids, speaker, language, args, wav_path,
-            bench_runs=args.runs, bench_warmup=args.warmup
+            bench_runs=args.runs, bench_warmup=args.warmup, verbose=False
         )
-        proc = subprocess.run(cmd, check=True, text=True, capture_output=True)
+        proc = subprocess.run(cmd, check=True, text=True, capture_output=True, env=env)
         results = parse_persistent_runs(proc.stderr)
         if not results:
             # Fallback to single-result parsing if binary does not emit persistent lines.
@@ -209,7 +253,7 @@ def bench_binary(
         os.close(fd)
         tmp_path = Path(tmp)
         try:
-            run_c_binary(binary, model_dir, token_ids, speaker, language, args, tmp_path)
+            run_c_binary(binary, model_dir, token_ids, speaker, language, args, tmp_path, env=env)
         finally:
             tmp_path.unlink(missing_ok=True)
         print(f"  [{label}] warmup {i+1}/{args.warmup}")
@@ -225,7 +269,7 @@ def bench_binary(
         else:
             cleanup = False
 
-        rr = run_c_binary(binary, model_dir, token_ids, speaker, language, args, wav_path)
+        rr = run_c_binary(binary, model_dir, token_ids, speaker, language, args, wav_path, env=env)
         results.append(rr)
 
         tok_info = f", {rr.codec_tokens} tokens" if rr.codec_tokens else ""
@@ -472,6 +516,7 @@ def main() -> int:
             "hostname": os.uname().nodename,
             "platform": sys.platform,
             "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "python_runtime": detect_python_runtime(),
         },
         "config": {
             "text": args.text,
