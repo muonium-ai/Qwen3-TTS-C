@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import wave
+from datetime import datetime
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -251,7 +252,6 @@ def bench_python(
 ) -> tuple[list[RunResult], float]:
     import numpy as np
     import torch
-    from transformers import AutoTokenizer
 
     from qwen_tts import Qwen3TTSModel
 
@@ -262,20 +262,23 @@ def bench_python(
     load_ms = (time.perf_counter() - t0) * 1000.0
     print(f"  [python] model loaded in {load_ms:.0f} ms")
 
-    tokenizer = AutoTokenizer.from_pretrained(model_dir, fix_mistral_regex=True)
-    chat_text = f"<|im_start|>assistant\n{args.text}<|im_end|>\n<|im_start|>assistant\n"
-    input_ids = tokenizer(chat_text, return_tensors="pt").input_ids
+    # Use the model's own tokenization helper. Passing a plain torch tensor to
+    # model.generate() can break on newer qwen_tts versions that expect
+    # list-style tokenized inputs.
+    input_ids = model._tokenize_texts([model._build_assistant_text(args.text)])
 
+    do_sample = args.temperature > 0.0
+    subtalker_do_sample = args.subtalker_temperature > 0.0
     gen_kwargs = model._merge_generate_kwargs(
-        do_sample=True,
+        do_sample=do_sample,
         top_k=args.top_k,
         top_p=args.top_p,
-        temperature=args.temperature,
+        temperature=args.temperature if args.temperature > 0.0 else 1.0,
         repetition_penalty=args.repetition_penalty,
-        subtalker_dosample=True,
+        subtalker_dosample=subtalker_do_sample,
         subtalker_top_k=args.subtalker_top_k,
         subtalker_top_p=args.subtalker_top_p,
-        subtalker_temperature=args.subtalker_temperature,
+        subtalker_temperature=args.subtalker_temperature if args.subtalker_temperature > 0.0 else 1.0,
         max_new_tokens=args.max_new_tokens,
     )
 
@@ -468,6 +471,7 @@ def main() -> int:
         "meta": {
             "hostname": os.uname().nodename,
             "platform": sys.platform,
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
         },
         "config": {
             "text": args.text,
@@ -541,9 +545,15 @@ def main() -> int:
 
     # ---- Save JSON report ----
     report["summaries"] = summaries
-    report_path = out_dir / "benchmark_all_results.json"
-    report_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    print(f"\nJSON report: {report_path}")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report["meta"]["timestamp"] = timestamp
+    json_text = json.dumps(report, indent=2, default=str)
+    report_latest = out_dir / "benchmark_all_results.json"
+    report_timestamped = out_dir / f"benchmark_all_results_{timestamp}.json"
+    report_latest.write_text(json_text, encoding="utf-8")
+    report_timestamped.write_text(json_text, encoding="utf-8")
+    print(f"\nJSON report (latest): {report_latest}")
+    print(f"JSON report (timestamped): {report_timestamped}")
 
     return 0
 

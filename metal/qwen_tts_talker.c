@@ -370,8 +370,6 @@ static void talker_attention_single_metal(
     float *k_buf,       /* scratch [kv_heads * head_dim] */
     float *v_buf,       /* scratch [kv_heads * head_dim] */
     float *attn_out,    /* scratch [num_heads * head_dim] */
-    const float *cos,   /* [3 * head_dim] for M-RoPE */
-    const float *sin_val,
     int pos
 ) {
     (void)x_norm;
@@ -392,29 +390,12 @@ static void talker_attention_single_metal(
     int seq_len = pos + 1;
     float scale = 1.0f / sqrtf((float)head_dim);
 
-    if (ensure_talker_metal_scratch(ctx) != 0) return;
     float *mtl_x_ptr = (float *)metal_buf_contents(ctx->mtl_x);
 
     /* Write x directly into shared Metal buffer (zero-copy on Apple Silicon). */
     if (x != mtl_x_ptr) {
         memcpy(mtl_x_ptr, x, hidden * sizeof(float));
     }
-
-    /* Build merged M-RoPE cos/sin once for this token. */
-    int sec[6];
-    sec[0] = cfg->mrope_section[0]; sec[1] = cfg->mrope_section[1]; sec[2] = cfg->mrope_section[2];
-    sec[3] = cfg->mrope_section[0]; sec[4] = cfg->mrope_section[1]; sec[5] = cfg->mrope_section[2];
-    float cos_m[512], sin_m[512];
-    int d = 0;
-    for (int chunk = 0; chunk < 6; chunk++) {
-        int stream = chunk % 3;
-        for (int i = 0; i < sec[chunk] && d < head_dim; i++, d++) {
-            cos_m[d] = cos[stream * head_dim + d];
-            sin_m[d] = sin_val[stream * head_dim + d];
-        }
-    }
-    metal_buf_write(ctx->mtl_rope_cos, cos_m, head_dim * sizeof(float));
-    metal_buf_write(ctx->mtl_rope_sin, sin_m, head_dim * sizeof(float));
 
     metal_rms_norm(ctx->mtl_x_norm, ctx->mtl_x, layer->mtl_input_norm, hidden, eps);
     metal_qkv_matvec_bf16(ctx->mtl_q, ctx->mtl_k, ctx->mtl_v,
@@ -870,6 +851,25 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
     float cos_mrope[3 * 512], sin_mrope[3 * 512];
     compute_mrope_pos(cos_mrope, sin_mrope, pos, head_dim, cfg->talker_rope_theta);
 
+#ifdef USE_METAL
+    if (use_metal_talker) {
+        int sec[6];
+        float cos_m[512], sin_m[512];
+        int d = 0;
+        sec[0] = cfg->mrope_section[0]; sec[1] = cfg->mrope_section[1]; sec[2] = cfg->mrope_section[2];
+        sec[3] = cfg->mrope_section[0]; sec[4] = cfg->mrope_section[1]; sec[5] = cfg->mrope_section[2];
+        for (int chunk = 0; chunk < 6; chunk++) {
+            int stream = chunk % 3;
+            for (int i = 0; i < sec[chunk] && d < head_dim; i++, d++) {
+                cos_m[d] = cos_mrope[stream * head_dim + d];
+                sin_m[d] = sin_mrope[stream * head_dim + d];
+            }
+        }
+        metal_buf_write(ctx->mtl_rope_cos, cos_m, head_dim * sizeof(float));
+        metal_buf_write(ctx->mtl_rope_sin, sin_m, head_dim * sizeof(float));
+    }
+#endif
+
     int trace_layers = should_trace_layers();
     double layer_ms[QWEN_TTS_MAX_TALKER_LAYERS] = {0};
     int batched_metal = 0;
@@ -888,7 +888,7 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
             if (trace_layers) metal_begin();
             talker_attention_single_metal(ctx, layer, x, ctx->tk_x_norm,
                                           ctx->tk_q, ctx->tk_k, ctx->tk_v,
-                                          ctx->tk_attn_out, cos_mrope, sin_mrope, pos);
+                                          ctx->tk_attn_out, pos);
             if (trace_layers) {
                 metal_sync();
                 layer_ms[layer] = talker_now_ms() - t_layer;

@@ -46,6 +46,7 @@ WASM_WASI_FLAGS = -O3 -DNDEBUG -s STANDALONE_WASM=1 -s PURE_WASI=1 -s WASMFS=1 \
 # Prefer python3.11 when available (commonly where torch is installed).
 PYTHON           ?= $(shell command -v python3.11 2>/dev/null || command -v python3 2>/dev/null || echo python3)
 BENCH_SCRIPT     ?= scripts/benchmark_py_vs_c.py
+BENCH_ALL_SCRIPT ?= scripts/benchmark_all.py
 EOS_PARITY_SCRIPT ?= scripts/validate_eos_parity.py
 BENCH_OUTPUT_DIR ?= benchmark_output
 BENCH_TEXT       ?= Hello from Qwen3-TTS benchmark. porting done by Muonium AI Studios
@@ -65,6 +66,7 @@ BENCH_REP_PEN    ?= 1.05
 BENCH_SUB_TEMP   ?= 0.9
 BENCH_SUB_TOP_K  ?= 50
 BENCH_SUB_TOP_P  ?= 1.0
+BENCH_PERSISTENT ?= 1
 BENCH_EQUAL_TOKEN_BUDGET ?= 0
 BENCH_GATE_MAX_C_OVER_PY_MS_PER_TOKEN ?= 0
 BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC ?= 0
@@ -263,6 +265,32 @@ benchmark: all
 		--gate-max-c-over-python-ms-per-audio-sec "$(BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC)" \
 		--output-dir "$(BENCH_OUTPUT_DIR)"
 
+.PHONY: benchmark-all
+benchmark-all: all
+	@test -n "$(MODEL_DIR)" || (echo "Error: set MODEL_DIR"; exit 1)
+	@test -d "$(MODEL_DIR)" || (echo "Error: model directory not found: $(MODEL_DIR)"; exit 1)
+	$(MAKE) -C metal all
+	QWEN_TTS_ENABLE_METAL=1 \
+	QWEN_TTS_METAL_TALKER=1 \
+	QWEN_TTS_METAL_SUBTALKER=1 \
+	$(PYTHON) $(BENCH_ALL_SCRIPT) \
+		--model-dir "$(MODEL_DIR)" \
+		--text "$(BENCH_TEXT)" \
+		--language "$(BENCH_LANGUAGE)" \
+		--speaker "$(if $(BENCH_SPEAKER),$(BENCH_SPEAKER),aiden)" \
+		--runs "$(BENCH_RUNS)" \
+		--warmup "$(BENCH_WARMUP)" \
+		--max-new-tokens "$(BENCH_MAX_TOKENS)" \
+		--temperature "$(BENCH_TEMP)" \
+		--top-k "$(BENCH_TOP_K)" \
+		--top-p "$(BENCH_TOP_P)" \
+		--repetition-penalty "$(BENCH_REP_PEN)" \
+		--subtalker-temperature "$(BENCH_SUB_TEMP)" \
+		--subtalker-top-k "$(BENCH_SUB_TOP_K)" \
+		--subtalker-top-p "$(BENCH_SUB_TOP_P)" \
+		$(if $(filter 1 true yes,$(BENCH_PERSISTENT)),--persistent,) \
+		--output-dir "$(BENCH_OUTPUT_DIR)"
+
 .PHONY: benchmark-gate
 benchmark-gate: BENCH_EQUAL_TOKEN_BUDGET = 128
 benchmark-gate: BENCH_RUNS = 1
@@ -341,6 +369,7 @@ help:
 	@echo "  make wasm-setup Install/activate vendored emsdk toolchain ($(EMSDK_VERSION))"
 	@echo "  make setup-benchmark Install Python benchmark dependencies into $(PYTHON)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
+	@echo "  make benchmark-all Run Python vs C vs Metal benchmark with default settings"
 	@echo "  make benchmark-gate Run benchmark with normalized-metric quality gates (CI-friendly)"
 	@echo "  make validate-eos Validate Python/C EOS stop parity (deterministic decode)"
 	@echo "  make test-eos-regression Assert C stops before max_tokens on standard prompt"
