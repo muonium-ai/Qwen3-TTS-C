@@ -962,11 +962,11 @@ void metal_swiglu_matvec_bf16(metal_buf_t out, metal_buf_t gate_up_bf16,
         [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:2];
         metal_params_t p = {.intermediate = intermediate, .hidden = hidden};
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        /* 4 SIMD groups (128 threads) per row for maximum memory bandwidth */
         {
-            NSUInteger total = (NSUInteger)intermediate * 32;
+            NSUInteger total = (NSUInteger)intermediate * 128;
             MTLSize grid = MTLSizeMake(total, 1, 1);
-            MTLSize group = MTLSizeMake(32, 1, 1);
+            MTLSize group = MTLSizeMake(128, 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:group];
         }
     }

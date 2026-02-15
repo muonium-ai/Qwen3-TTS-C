@@ -886,11 +886,66 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
     int final_len = raw_out_len - right_pad;
     if (final_len < 0) final_len = 0;
 
+#ifdef USE_BLAS
     /*
-     * Cache-friendly loop order:
-     *   iterate output channel first so writes stay contiguous in out[oc, :].
-     * Weight layout is [in_channels, out_channels, kernel_size].
+     * GEMM fast path: one sgemm per kernel tap instead of millions of tiny saxpy calls.
+     * For each tap k: temp[out, len] = W_k^T @ input, then scatter to strided output.
      */
+    {
+        size_t wk_size = (size_t)out_channels * in_channels;
+        size_t temp_size = (size_t)out_channels * length;
+        float *wk_packed = (float *)malloc(wk_size * sizeof(float));
+        float *temp = (float *)malloc(temp_size * sizeof(float));
+        if (wk_packed && temp) {
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * final_len;
+                float b = bias ? bias[oc] : 0.0f;
+                for (int t = 0; t < final_len; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                for (int oc = 0; oc < out_channels; oc++) {
+                    for (int ic = 0; ic < in_channels; ic++) {
+                        wk_packed[(size_t)oc * in_channels + ic] =
+                            weight[(size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size + k];
+                    }
+                }
+
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            out_channels, n, in_channels,
+                            1.0f, wk_packed, in_channels,
+                            input, length,
+                            0.0f, temp, n);
+
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const float *tp = temp + (size_t)oc * n;
+                    float *op = out + (size_t)oc * final_len + k;
+                    for (int t = 0; t < n; t++) {
+                        op[t * stride] += tp[t];
+                    }
+                }
+            }
+            free(wk_packed);
+            free(temp);
+            if (out_length) *out_length = final_len;
+            return;
+        }
+        free(wk_packed);
+        free(temp);
+    }
+#endif
+
+    /* Scalar fallback */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif
@@ -902,14 +957,6 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
         for (int ic = 0; ic < in_channels; ic++) {
             const float *in_ch = input + (size_t)ic * length;
             const float *w = weight + (size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size;
-#ifdef USE_BLAS
-            for (int k = 0; k < kernel_size; k++) {
-                int n = (final_len - 1 - k) / stride + 1;
-                if (n <= 0) continue;
-                if (n > length) n = length;
-                cblas_saxpy(n, w[k], in_ch, 1, out_ch + k, stride);
-            }
-#else
             for (int t = 0; t < length; t++) {
                 float val = in_ch[t];
                 int base = t * stride;
@@ -918,7 +965,6 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
                     if (ot < final_len) out_ch[ot] += val * w[k];
                 }
             }
-#endif
         }
     }
 
