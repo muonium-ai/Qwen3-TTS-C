@@ -256,6 +256,47 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
      *   alpha = exp(alpha_log)
      *   beta = 1 / (exp(beta_log) + eps)
      */
+#if defined(ACCELERATE_NEW_LAPACK)
+    /* Vectorized path using Accelerate vvsinf + vDSP (4-8x faster than scalar sinf) */
+    int L = length;
+    vDSP_Length vL = (vDSP_Length)length;
+#ifdef USE_OPENMP
+#pragma omp parallel
+    {
+        float *tmp = (float *)malloc((size_t)length * sizeof(float));
+#pragma omp for schedule(static)
+        for (int c = 0; c < channels; c++) {
+            if (!tmp) continue;
+            float a = alpha[c];
+            float inv_b = beta[c];
+            const float *xc = x + (size_t)c * length;
+            float *oc = out + (size_t)c * length;
+            vDSP_vsmul(xc, 1, &a, tmp, 1, vL);     /* tmp = alpha * x */
+            vvsinf(tmp, tmp, &L);                    /* tmp = sin(alpha * x) */
+            vDSP_vsq(tmp, 1, tmp, 1, vL);           /* tmp = sin^2(alpha * x) */
+            vDSP_vsma(tmp, 1, &inv_b, xc, 1, oc, 1, vL); /* out = inv_b * tmp + x */
+        }
+        free(tmp);
+    }
+#else
+    float *tmp = (float *)malloc((size_t)length * sizeof(float));
+    if (tmp) {
+        for (int c = 0; c < channels; c++) {
+            float a = alpha[c];
+            float inv_b = beta[c];
+            const float *xc = x + (size_t)c * length;
+            float *oc = out + (size_t)c * length;
+            vDSP_vsmul(xc, 1, &a, tmp, 1, vL);
+            vvsinf(tmp, tmp, &L);
+            vDSP_vsq(tmp, 1, tmp, 1, vL);
+            vDSP_vsma(tmp, 1, &inv_b, xc, 1, oc, 1, vL);
+        }
+        free(tmp);
+    }
+#endif
+    return;
+#endif
+    /* Scalar fallback */
 #ifdef USE_OPENMP
 #pragma omp parallel for schedule(static)
 #endif

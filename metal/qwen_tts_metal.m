@@ -23,6 +23,7 @@ typedef struct {
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLCommandBuffer> cmd_buf;
+    id<MTLComputeCommandEncoder> encoder;  /* reused across dispatches */
     bool committed;
     int initialized;
 
@@ -245,6 +246,10 @@ int metal_is_available(void) {
 void metal_shutdown(void) {
     if (!g_metal.initialized) return;
     @autoreleasepool {
+        if (g_metal.encoder) {
+            [g_metal.encoder endEncoding];
+            g_metal.encoder = nil;
+        }
         if (g_metal.cmd_buf) {
             [g_metal.cmd_buf waitUntilCompleted];
             g_metal.cmd_buf = nil;
@@ -379,6 +384,10 @@ void metal_buf_read(metal_buf_t buf, void *dst, size_t size) {
 void metal_begin(void) {
     if (!g_metal.initialized) return;
     @autoreleasepool {
+        if (g_metal.encoder) {
+            [g_metal.encoder endEncoding];
+            g_metal.encoder = nil;
+        }
         if (g_metal.cmd_buf) {
             [g_metal.cmd_buf waitUntilCompleted];
         }
@@ -389,12 +398,20 @@ void metal_begin(void) {
 
 void metal_commit(void) {
     if (!g_metal.initialized || !g_metal.cmd_buf) return;
+    if (g_metal.encoder) {
+        [g_metal.encoder endEncoding];
+        g_metal.encoder = nil;
+    }
     [g_metal.cmd_buf commit];
     g_metal.committed = true;
 }
 
 void metal_sync(void) {
     if (!g_metal.initialized || !g_metal.cmd_buf) return;
+    if (g_metal.encoder) {
+        [g_metal.encoder endEncoding];
+        g_metal.encoder = nil;
+    }
     if (!g_metal.committed) {
         [g_metal.cmd_buf commit];
     }
@@ -414,12 +431,15 @@ static void ensure_cmd_buf(void) {
     }
 }
 
-/* Create a compute encoder, set pipeline and buffers, dispatch, end encoding */
+/* Get the shared compute encoder, set pipeline state.
+ * Encoder is created once per command buffer and reused across all dispatches. */
 static id<MTLComputeCommandEncoder> begin_compute(id<MTLComputePipelineState> ps) {
     ensure_cmd_buf();
-    id<MTLComputeCommandEncoder> enc = [g_metal.cmd_buf computeCommandEncoder];
-    [enc setComputePipelineState:ps];
-    return enc;
+    if (!g_metal.encoder) {
+        g_metal.encoder = [g_metal.cmd_buf computeCommandEncoder];
+    }
+    [g_metal.encoder setComputePipelineState:ps];
+    return g_metal.encoder;
 }
 
 static void dispatch_1d(id<MTLComputeCommandEncoder> enc,
@@ -429,7 +449,6 @@ static void dispatch_1d(id<MTLComputeCommandEncoder> enc,
     MTLSize gridSize = MTLSizeMake(threads, 1, 1);
     MTLSize groupSize = MTLSizeMake(tw < threads ? tw : threads, 1, 1);
     [enc dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-    [enc endEncoding];
 }
 
 static void dispatch_2d(id<MTLComputeCommandEncoder> enc,
@@ -442,7 +461,6 @@ static void dispatch_2d(id<MTLComputeCommandEncoder> enc,
     if (w < (int)tw) { gw = (NSUInteger)w; }
     MTLSize groupSize = MTLSizeMake(gw, gh, 1);
     [enc dispatchThreads:gridSize threadsPerThreadgroup:groupSize];
-    [enc endEncoding];
 }
 
 /* ========================================================================
@@ -494,13 +512,12 @@ void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
         [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:2];
         metal_params_t p = {.rows = rows, .cols = cols};
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        /* 4 SIMD groups (128 threads) per row for maximum memory bandwidth */
         {
-            NSUInteger total = (NSUInteger)rows * 32;
+            NSUInteger total = (NSUInteger)rows * 128;
             MTLSize grid = MTLSizeMake(total, 1, 1);
-            MTLSize group = MTLSizeMake(32, 1, 1);
+            MTLSize group = MTLSizeMake(128, 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:group];
-            [enc endEncoding];
         }
     }
 }
@@ -522,13 +539,12 @@ void metal_qkv_matvec_bf16(metal_buf_t q, metal_buf_t k, metal_buf_t v,
         int q_rows = num_heads * head_dim;
         int kv_rows = kv_heads * head_dim;
         int total_rows = q_rows + kv_rows + kv_rows;
-        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        /* 4 SIMD groups (128 threads) per row for maximum memory bandwidth */
         {
-            NSUInteger total = (NSUInteger)total_rows * 32;
+            NSUInteger total = (NSUInteger)total_rows * 128;
             MTLSize grid = MTLSizeMake(total, 1, 1);
-            MTLSize group = MTLSizeMake(32, 1, 1);
+            MTLSize group = MTLSizeMake(128, 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:group];
-            [enc endEncoding];
         }
     }
 }
@@ -588,7 +604,6 @@ void metal_rms_norm(metal_buf_t out, metal_buf_t x, metal_buf_t weight,
         if (tg > 1024) tg = 1024;
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -606,7 +621,6 @@ void metal_rms_norm_inplace(metal_buf_t x, metal_buf_t weight,
         if (tg > 1024) tg = 1024;
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -624,7 +638,6 @@ void metal_layer_norm(metal_buf_t out, metal_buf_t x, metal_buf_t weight,
         if ((NSUInteger)dim < tg) tg = (NSUInteger)dim;
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -638,7 +651,6 @@ void metal_softmax(metal_buf_t x, int n) {
         if ((NSUInteger)n < tg) tg = (NSUInteger)n;
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -660,7 +672,6 @@ void metal_qk_norm_rope(metal_buf_t q, metal_buf_t k,
         if ((NSUInteger)head_dim < tg) tg = (NSUInteger)head_dim;
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(num_heads + kv_heads), 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -710,7 +721,6 @@ void metal_attn_softmax_rows(metal_buf_t scores, int num_heads, int seq_len, int
         }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -757,7 +767,6 @@ void metal_attn_fused(metal_buf_t out, metal_buf_t scores, metal_buf_t q,
         }
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)num_heads, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -941,7 +950,6 @@ void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n) {
         }
         [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-        [enc endEncoding];
     }
 }
 
@@ -960,7 +968,6 @@ void metal_swiglu_matvec_bf16(metal_buf_t out, metal_buf_t gate_up_bf16,
             MTLSize grid = MTLSizeMake(total, 1, 1);
             MTLSize group = MTLSizeMake(32, 1, 1);
             [enc dispatchThreads:grid threadsPerThreadgroup:group];
-            [enc endEncoding];
         }
     }
 }

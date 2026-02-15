@@ -8,7 +8,12 @@
       "Bash(git commit:*)",
       "Bash(git rm:*)",
       "Bash(git add:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(python3.11:*)",
+      "Bash(/Users/senthil/code/Qwen3-TTS-C/metal/qwen-tts-metal:*)",
+      "Bash(/Users/senthil/code/Qwen3-TTS-C/qwen-tts:*)",
+      "Bash(python3:*)",
+      "Bash(git status:*)"
     ],
     "additionalDirectories": [
       "/Users/senthil/code/Qwen3-TTS-C/c"
