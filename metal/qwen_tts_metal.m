@@ -494,7 +494,14 @@ void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
         [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:2];
         metal_params_t p = {.rows = rows, .cols = cols};
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(enc, g_metal.ps_matvec_bf16, rows);
+        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        {
+            NSUInteger total = (NSUInteger)rows * 32;
+            MTLSize grid = MTLSizeMake(total, 1, 1);
+            MTLSize group = MTLSizeMake(32, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:group];
+            [enc endEncoding];
+        }
     }
 }
 
@@ -515,7 +522,14 @@ void metal_qkv_matvec_bf16(metal_buf_t q, metal_buf_t k, metal_buf_t v,
         int q_rows = num_heads * head_dim;
         int kv_rows = kv_heads * head_dim;
         int total_rows = q_rows + kv_rows + kv_rows;
-        dispatch_1d(enc, g_metal.ps_qkv_matvec_bf16, total_rows);
+        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        {
+            NSUInteger total = (NSUInteger)total_rows * 32;
+            MTLSize grid = MTLSizeMake(total, 1, 1);
+            MTLSize group = MTLSizeMake(32, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:group];
+            [enc endEncoding];
+        }
     }
 }
 
@@ -940,6 +954,13 @@ void metal_swiglu_matvec_bf16(metal_buf_t out, metal_buf_t gate_up_bf16,
         [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:2];
         metal_params_t p = {.intermediate = intermediate, .hidden = hidden};
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        dispatch_1d(enc, g_metal.ps_swiglu_matvec_bf16, intermediate);
+        /* 32 threads per row (SIMD group), hardware simd_sum reduction */
+        {
+            NSUInteger total = (NSUInteger)intermediate * 32;
+            MTLSize grid = MTLSizeMake(total, 1, 1);
+            MTLSize group = MTLSizeMake(32, 1, 1);
+            [enc dispatchThreads:grid threadsPerThreadgroup:group];
+            [enc endEncoding];
+        }
     }
 }

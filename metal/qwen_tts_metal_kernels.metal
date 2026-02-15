@@ -54,9 +54,11 @@ inline float bf16_to_f32(ushort bf16) {
 }
 
 /* ========================================================================
- * Matrix-Vector Multiply (BF16 weights)
+ * Matrix-Vector Multiply (BF16 weights) — SIMD-group optimized
  * out[row] = sum_c A_bf16[row, c] * x[c]
- * One thread per output row.
+ * 32 threads per row (one SIMD group), each handles cols/32 elements,
+ * then simd_sum() for hardware-accelerated reduction.
+ * Dispatch: rows * 32 total threads, threadgroup size = 32.
  * ======================================================================== */
 
 kernel void kernel_matvec_bf16_metal(
@@ -64,33 +66,30 @@ kernel void kernel_matvec_bf16_metal(
     const device ushort *A_bf16 [[buffer(1)]],
     const device float *x [[buffer(2)]],
     constant Params &p [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]])
 {
-    if ((int)gid >= p.rows) return;
+    int row = (int)(gid / 32);
+    if (row >= p.rows) return;
 
-    int row = (int)gid;
     const device ushort *a_row = A_bf16 + (long)row * p.cols;
-    const device float4 *x4 = (const device float4 *)x;
-    float4 acc = float4(0.0f);
+    int lane = (int)simd_lane;
+    float sum = 0.0f;
 
-    /* Process 4 elements at a time using float4 + dot() */
-    int c4 = p.cols / 4;
-    for (int i = 0; i < c4; i++) {
-        int base = i * 4;
-        float4 a4 = float4(bf16_to_f32(a_row[base]),
-                           bf16_to_f32(a_row[base + 1]),
-                           bf16_to_f32(a_row[base + 2]),
-                           bf16_to_f32(a_row[base + 3]));
-        acc += a4 * x4[i];
-    }
-    float sum = acc.x + acc.y + acc.z + acc.w;
-
-    /* Handle remainder */
-    for (int c = c4 * 4; c < p.cols; c++) {
-        sum += bf16_to_f32(a_row[c]) * x[c];
+    /* Each of 32 lanes handles a strided subset of columns */
+    for (int c = lane * 4; c < p.cols; c += 128) {
+        int end = min(c + 4, p.cols);
+        for (int j = c; j < end; j++) {
+            sum += bf16_to_f32(a_row[j]) * x[j];
+        }
     }
 
-    out[row] = sum;
+    /* Hardware SIMD reduction across 32 lanes */
+    sum = simd_sum(sum);
+
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
 }
 
 /* ========================================================================
@@ -345,7 +344,8 @@ kernel void kernel_softmax_metal(
 
 /* ========================================================================
  * Fused QKV matvec (BF16): computes Q, K, V in one dispatch
- * q rows: [num_heads * head_dim], k/v rows: [kv_heads * head_dim]
+ * 32 threads (one SIMD group) per row, simd_sum() reduction.
+ * Dispatch: total_rows * 32 threads, threadgroup size = 32.
  * ======================================================================== */
 
 kernel void kernel_qkv_matvec_bf16_metal(
@@ -357,12 +357,13 @@ kernel void kernel_qkv_matvec_bf16_metal(
     const device ushort *wv_bf16 [[buffer(5)]],
     const device float *x [[buffer(6)]],
     constant Params &p [[buffer(7)]],
-    uint gid [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]])
 {
     int q_rows = p.num_heads * p.head_dim;
     int kv_rows = p.kv_heads * p.head_dim;
     int total_rows = q_rows + kv_rows + kv_rows;
-    int row = (int)gid;
+    int row = (int)(gid / 32);
     if (row >= total_rows) return;
 
     const device ushort *w_row = nullptr;
@@ -384,22 +385,21 @@ kernel void kernel_qkv_matvec_bf16_metal(
         out_row = r;
     }
 
-    const device float4 *x4 = (const device float4 *)x;
-    float4 acc = float4(0.0f);
-    int c4 = p.hidden / 4;
-    for (int i = 0; i < c4; i++) {
-        int base = i * 4;
-        float4 a4 = float4(bf16_to_f32(w_row[base]),
-                           bf16_to_f32(w_row[base + 1]),
-                           bf16_to_f32(w_row[base + 2]),
-                           bf16_to_f32(w_row[base + 3]));
-        acc += a4 * x4[i];
+    int lane = (int)simd_lane;
+    float sum = 0.0f;
+
+    for (int c = lane * 4; c < p.hidden; c += 128) {
+        int end = min(c + 4, p.hidden);
+        for (int j = c; j < end; j++) {
+            sum += bf16_to_f32(w_row[j]) * x[j];
+        }
     }
-    float sum = acc.x + acc.y + acc.z + acc.w;
-    for (int c = c4 * 4; c < p.hidden; c++) {
-        sum += bf16_to_f32(w_row[c]) * x[c];
+
+    sum = simd_sum(sum);
+
+    if (simd_lane == 0) {
+        out[out_row] = sum;
     }
-    out[out_row] = sum;
 }
 
 /* ========================================================================
@@ -946,7 +946,8 @@ kernel void kernel_argmax_i32_metal(
  * SwiGLU Fused Matvec (BF16)
  * gate_up_fused: [2*intermediate, hidden] BF16
  * out[i] = silu(gate[i]) * up[i]
- * One thread per intermediate dimension
+ * 32 threads (one SIMD group) per output row, simd_sum() reduction.
+ * Dispatch: intermediate * 32 threads, threadgroup size = 32.
  * ======================================================================== */
 
 kernel void kernel_swiglu_matvec_bf16_metal(
@@ -954,44 +955,38 @@ kernel void kernel_swiglu_matvec_bf16_metal(
     const device ushort *gate_up_bf16 [[buffer(1)]],
     const device float *x [[buffer(2)]],
     constant Params &p [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
+    uint gid [[thread_position_in_grid]],
+    uint simd_lane [[thread_index_in_simdgroup]])
 {
-    if ((int)gid >= p.intermediate) return;
+    int i = (int)(gid / 32);
+    if (i >= p.intermediate) return;
 
-    int i = (int)gid;
-    const device float4 *x4 = (const device float4 *)x;
-    int c4 = p.hidden / 4;
+    int lane = (int)simd_lane;
 
     /* Compute gate = gate_weights[i] @ x */
     const device ushort *gate_row = gate_up_bf16 + (long)i * p.hidden;
-    float4 gacc = float4(0.0f);
-    for (int j = 0; j < c4; j++) {
-        int base = j * 4;
-        float4 a4 = float4(bf16_to_f32(gate_row[base]),
-                           bf16_to_f32(gate_row[base + 1]),
-                           bf16_to_f32(gate_row[base + 2]),
-                           bf16_to_f32(gate_row[base + 3]));
-        gacc += a4 * x4[j];
+    float gate_sum = 0.0f;
+    for (int c = lane * 4; c < p.hidden; c += 128) {
+        int end = min(c + 4, p.hidden);
+        for (int j = c; j < end; j++) {
+            gate_sum += bf16_to_f32(gate_row[j]) * x[j];
+        }
     }
-    float gate_val = gacc.x + gacc.y + gacc.z + gacc.w;
-    for (int c = c4 * 4; c < p.hidden; c++)
-        gate_val += bf16_to_f32(gate_row[c]) * x[c];
+    float gate_val = simd_sum(gate_sum);
 
     /* Compute up = up_weights[i] @ x */
     const device ushort *up_row = gate_up_bf16 + ((long)p.intermediate + i) * p.hidden;
-    float4 uacc = float4(0.0f);
-    for (int j = 0; j < c4; j++) {
-        int base = j * 4;
-        float4 a4 = float4(bf16_to_f32(up_row[base]),
-                           bf16_to_f32(up_row[base + 1]),
-                           bf16_to_f32(up_row[base + 2]),
-                           bf16_to_f32(up_row[base + 3]));
-        uacc += a4 * x4[j];
+    float up_sum = 0.0f;
+    for (int c = lane * 4; c < p.hidden; c += 128) {
+        int end = min(c + 4, p.hidden);
+        for (int j = c; j < end; j++) {
+            up_sum += bf16_to_f32(up_row[j]) * x[j];
+        }
     }
-    float up_val = uacc.x + uacc.y + uacc.z + uacc.w;
-    for (int c = c4 * 4; c < p.hidden; c++)
-        up_val += bf16_to_f32(up_row[c]) * x[c];
+    float up_val = simd_sum(up_sum);
 
-    /* SiLU(gate) * up */
-    out[i] = (gate_val / (1.0f + exp(-gate_val))) * up_val;
+    /* SiLU(gate) * up — only lane 0 writes */
+    if (simd_lane == 0) {
+        out[i] = (gate_val / (1.0f + exp(-gate_val))) * up_val;
+    }
 }
