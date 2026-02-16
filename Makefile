@@ -71,6 +71,9 @@ BENCH_SUB_TEMP   ?= 0.9
 BENCH_SUB_TOP_K  ?= 50
 BENCH_SUB_TOP_P  ?= 1.0
 BENCH_PERSISTENT ?= 1
+BENCH_HYBRID_VOCODER ?= 1
+BENCH_SKIP_PYTHON ?= 0
+BENCH_SKIP_C ?= 0
 BENCH_EQUAL_TOKEN_BUDGET ?= 0
 BENCH_GATE_MAX_C_OVER_PY_MS_PER_TOKEN ?= 0
 BENCH_GATE_MAX_C_OVER_PY_MS_PER_AUDIO_SEC ?= 0
@@ -277,6 +280,7 @@ benchmark-all: all
 	QWEN_TTS_ENABLE_METAL=1 \
 	QWEN_TTS_METAL_TALKER=1 \
 	QWEN_TTS_METAL_SUBTALKER=1 \
+	QWEN_TTS_HYBRID_VOCODER="$(BENCH_HYBRID_VOCODER)" \
 	$(PYTHON) $(BENCH_ALL_SCRIPT) \
 		--model-dir "$(MODEL_DIR)" \
 		--text "$(BENCH_TEXT)" \
@@ -292,8 +296,16 @@ benchmark-all: all
 		--subtalker-temperature "$(BENCH_SUB_TEMP)" \
 		--subtalker-top-k "$(BENCH_SUB_TOP_K)" \
 		--subtalker-top-p "$(BENCH_SUB_TOP_P)" \
+		$(if $(filter 1 true yes,$(BENCH_SKIP_PYTHON)),--skip-python,) \
+		$(if $(filter 1 true yes,$(BENCH_SKIP_C)),--skip-c,) \
 		$(if $(filter 1 true yes,$(BENCH_PERSISTENT)),--persistent,) \
 		--output-dir "$(BENCH_OUTPUT_DIR)"
+
+.PHONY: gpu-all
+gpu-all: BENCH_HYBRID_VOCODER = 1
+gpu-all: BENCH_SKIP_PYTHON = 1
+gpu-all: BENCH_SKIP_C = 1
+gpu-all: benchmark-all
 
 .PHONY: benchmark-gate
 benchmark-gate: BENCH_EQUAL_TOKEN_BUDGET = 128
@@ -378,7 +390,8 @@ help:
 	@echo "  make wasm-setup Install/activate vendored emsdk toolchain ($(EMSDK_VERSION))"
 	@echo "  make setup-benchmark Install benchmark dependencies into uv Python $(PYTHON_VERSION)"
 	@echo "  make benchmark Run Python vs C benchmark (set MODEL_DIR or PYTHON_MODEL/C_MODEL_DIR)"
-	@echo "  make benchmark-all Run Python vs C vs Metal benchmark with default settings"
+	@echo "  make benchmark-all Run Python vs C vs Metal (+Metal hybrid-off) benchmark"
+	@echo "  make gpu-all    Run benchmark-all with --skip-python --skip-c (Metal-only variants)"
 	@echo "  make benchmark-gate Run benchmark with normalized-metric quality gates (CI-friendly)"
 	@echo "  make validate-eos Validate Python/C EOS stop parity (deterministic decode)"
 	@echo "  make test-eos-regression Assert C stops before max_tokens on standard prompt"

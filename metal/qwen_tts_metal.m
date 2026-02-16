@@ -60,6 +60,7 @@ typedef struct {
     id<MTLComputePipelineState> ps_transposed_conv1d;
     id<MTLComputePipelineState> ps_bf16_to_f32;
     id<MTLComputePipelineState> ps_argmax_i32;
+    id<MTLComputePipelineState> ps_sample_topk_i32;
     id<MTLComputePipelineState> ps_swiglu_matvec_bf16;
     id<MTLComputePipelineState> ps_embed_from_argmax_bf16;
     id<MTLComputePipelineState> ps_scatter_int;
@@ -231,6 +232,7 @@ int metal_init(void) {
         g_metal.ps_transposed_conv1d = create_pipeline("kernel_transposed_conv1d_metal");
         g_metal.ps_bf16_to_f32 = create_pipeline("kernel_bf16_to_f32_metal");
         g_metal.ps_argmax_i32 = create_pipeline("kernel_argmax_i32_metal");
+        g_metal.ps_sample_topk_i32 = create_pipeline("kernel_sample_topk_i32_metal");
         g_metal.ps_swiglu_matvec_bf16 = create_pipeline("kernel_swiglu_matvec_bf16_metal");
         g_metal.ps_embed_from_argmax_bf16 = create_pipeline("kernel_embed_from_argmax_bf16_metal");
         g_metal.ps_scatter_int = create_pipeline("kernel_scatter_int_metal");
@@ -505,6 +507,9 @@ typedef struct {
     int pos;
     int row_idx;
     int row_size;
+    int top_k;
+    float temperature;
+    float rand_u;
 } metal_params_t;
 
 void metal_matvec_bf16(metal_buf_t out, metal_buf_t A_bf16, metal_buf_t x,
@@ -956,6 +961,38 @@ void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n) {
         [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:1];
         metal_params_t p = {.n = n};
         [enc setBytes:&p length:sizeof(p) atIndex:2];
+        NSUInteger tg = 256;
+        if ((NSUInteger)n < tg) {
+            tg = 1;
+            while ((int)tg < n) tg <<= 1;
+            if (tg > 256) tg = 256;
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+    }
+}
+
+void metal_sample_topk_i32(metal_buf_t out_idx, metal_buf_t x, int n,
+                           int top_k, float temperature, float rand_u) {
+    metal_sample_topk_scatter_i32(out_idx, x, METAL_BUF_INVALID, -1, n, top_k, temperature, rand_u);
+}
+
+void metal_sample_topk_scatter_i32(metal_buf_t out_idx, metal_buf_t x, metal_buf_t dst_codes, int dst_idx,
+                                   int n, int top_k, float temperature, float rand_u) {
+    if (!g_metal.ps_sample_topk_i32) {
+        metal_argmax_i32(out_idx, x, n);
+        if (dst_codes >= 0 && dst_idx >= 0) {
+            metal_scatter_int(dst_codes, out_idx, dst_idx);
+        }
+        return;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = begin_compute(g_metal.ps_sample_topk_i32);
+        [enc setBuffer:g_metal.buffers[out_idx] offset:0 atIndex:0];
+        [enc setBuffer:g_metal.buffers[x] offset:0 atIndex:1];
+        [enc setBuffer:(dst_codes >= 0 ? g_metal.buffers[dst_codes] : nil) offset:0 atIndex:2];
+        metal_params_t p = {.n = n, .top_k = top_k, .temperature = temperature, .rand_u = rand_u, .pos = dst_idx};
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
         NSUInteger tg = 256;
         if ((NSUInteger)n < tg) {
             tg = 1;

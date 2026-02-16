@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Benchmark Qwen3-TTS: Python vs C (CPU) vs Metal (GPU).
+"""Benchmark Qwen3-TTS: Python vs C (CPU) vs Metal (GPU) variants.
 
-Compares end-to-end generation latency across all three backends.
+Compares end-to-end generation latency across multiple backends.
 Produces a summary table and JSON report.
 
 Usage:
@@ -214,10 +214,12 @@ def bench_binary(
     out_dir: Path,
 ) -> list[RunResult]:
     env = os.environ.copy()
-    if label == "metal":
+    if label in {"metal", "metal_hybrid_off"}:
         env.setdefault("QWEN_TTS_ENABLE_METAL", "1")
         env.setdefault("QWEN_TTS_METAL_TALKER", "1")
         env.setdefault("QWEN_TTS_METAL_SUBTALKER", "1")
+    if label == "metal_hybrid_off":
+        env["QWEN_TTS_HYBRID_VOCODER"] = "0"
 
     if args.persistent:
         wav_path = out_dir / f"{label}_output.wav"
@@ -413,17 +415,20 @@ def summarize(results: list[RunResult]) -> dict[str, Any]:
 def print_table(summaries: dict[str, dict[str, Any]]) -> None:
     """Print a comparison table."""
     labels = list(summaries.keys())
-    print("\n" + "=" * 78)
-    print(f"{'Metric':<28}", end="")
+    metric_w = 28
+    col_w = max(16, max(len(l) for l in labels) + 2)
+    table_w = metric_w + col_w * len(labels)
+    print("\n" + "=" * table_w)
+    print(f"{'Metric':<{metric_w}}", end="")
     for l in labels:
-        print(f"{l:>16}", end="")
+        print(f"{l:>{col_w}}", end="")
     print()
-    print("-" * 78)
+    print("-" * table_w)
 
     def row(name: str, vals: list[str]) -> None:
-        print(f"{name:<28}", end="")
+        print(f"{name:<{metric_w}}", end="")
         for v in vals:
-            print(f"{v:>16}", end="")
+            print(f"{v:>{col_w}}", end="")
         print()
 
     row("Median elapsed (ms)", [
@@ -448,7 +453,7 @@ def print_table(summaries: dict[str, dict[str, Any]]) -> None:
     # Speedups relative to first entry
     base_label = labels[0]
     base_median = summaries[base_label]["elapsed_ms"]["median"]
-    print("-" * 78)
+    print("-" * table_w)
     row(f"Speedup vs {base_label}", [
         f"{base_median / s['elapsed_ms']['median']:.2f}x"
         for s in summaries.values()])
@@ -459,11 +464,11 @@ def print_table(summaries: dict[str, dict[str, Any]]) -> None:
             f"{s['ms_per_token']['median'] / base_ms_tok:.2f}x"
             for s in summaries.values()])
 
-    print("=" * 78)
+    print("=" * table_w)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark Python vs C (CPU) vs Metal (GPU)")
+    parser = argparse.ArgumentParser(description="Benchmark Python vs C (CPU) vs Metal (GPU) variants")
     parser.add_argument("--model-dir", required=True, help="Model directory")
     parser.add_argument("--text", default="Hello from Qwen3-TTS benchmark. porting done by Muonium AI Studios")
     parser.add_argument("--language", default="English")
@@ -491,6 +496,8 @@ def main() -> int:
     parser.add_argument("--skip-python", action="store_true", help="Skip Python benchmark")
     parser.add_argument("--skip-c", action="store_true", help="Skip C CPU benchmark")
     parser.add_argument("--skip-metal", action="store_true", help="Skip Metal GPU benchmark")
+    parser.add_argument("--skip-metal-hybrid-off", action="store_true",
+                        help="Skip Metal GPU benchmark with QWEN_TTS_HYBRID_VOCODER=0")
     parser.add_argument("--output-dir", default="benchmark_output")
     parser.add_argument("--persistent", action="store_true",
                         help="Use process-persistent C/Metal benchmark mode")
@@ -593,18 +600,35 @@ def main() -> int:
     if not args.skip_metal:
         metal_bin = Path(args.metal_bin)
         if metal_bin.exists():
-            print(f"\n=== Metal (GPU) - {metal_bin} ===")
+            print(f"\n=== Metal (GPU, Hybrid On) - {metal_bin} ===")
             metal_results = bench_binary(
                 "metal", metal_bin, model_dir, token_ids_str,
                 args.speaker, args.language, args, out_dir
             )
             metal_summary = summarize(metal_results)
-            summaries["Metal (GPU)"] = metal_summary
+            summaries["Metal (GPU, Hybrid On)"] = metal_summary
             report["metal"] = metal_summary
         else:
-            print(f"\n=== Metal (GPU): binary not found: {metal_bin} ===")
+            print(f"\n=== Metal (GPU, Hybrid On): binary not found: {metal_bin} ===")
     else:
-        print("\n=== Metal (GPU): SKIPPED ===")
+        print("\n=== Metal (GPU, Hybrid On): SKIPPED ===")
+
+    # ---- Metal GPU benchmark (hybrid vocoder off) ----
+    if not args.skip_metal_hybrid_off:
+        metal_bin = Path(args.metal_bin)
+        if metal_bin.exists():
+            print(f"\n=== Metal (GPU, Hybrid Vocoder Off) - {metal_bin} ===")
+            metal_hybrid_off_results = bench_binary(
+                "metal_hybrid_off", metal_bin, model_dir, token_ids_str,
+                args.speaker, args.language, args, out_dir
+            )
+            metal_hybrid_off_summary = summarize(metal_hybrid_off_results)
+            summaries["Metal (GPU, Hybrid Off)"] = metal_hybrid_off_summary
+            report["metal_hybrid_off"] = metal_hybrid_off_summary
+        else:
+            print(f"\n=== Metal (GPU, Hybrid Vocoder Off): binary not found: {metal_bin} ===")
+    else:
+        print("\n=== Metal (GPU, Hybrid Vocoder Off): SKIPPED ===")
 
     if len(summaries) < 2:
         print("\nNeed at least 2 backends to compare. Exiting.")

@@ -45,6 +45,9 @@ struct Params {
     int pos;
     int row_idx;
     int row_size;
+    int top_k;
+    float temperature;
+    float rand_u;
 };
 
 /* BF16 to F32 conversion */
@@ -953,6 +956,218 @@ kernel void kernel_argmax_i32_metal(
 
     if (tid == 0) {
         out_idx[0] = shared_idx[0];
+    }
+}
+
+/* ========================================================================
+ * Top-K sampling over logits (single token).
+ * Matches CPU top-k fast path semantics (top_p disabled) with one random draw.
+ * Fast path uses threadgroup-parallel top-k selection/reduction.
+ * ======================================================================== */
+
+kernel void kernel_sample_topk_i32_metal(
+    device int *out_idx [[buffer(0)]],
+    const device float *x [[buffer(1)]],
+    device int *dst_codes [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]])
+{
+    constexpr int MAX_TOPK = 256;
+    constexpr int MAX_MASK_WORDS = 128; /* supports n <= 4096 */
+    constexpr int MAX_TG = 256;
+
+    if (p.n <= 0) {
+        if (tid == 0) out_idx[0] = 0;
+        return;
+    }
+
+    if (p.n > MAX_MASK_WORDS * 32) {
+        /* Rare fallback for large vocab sizes: single-thread argmax/top-k. */
+        if (tid == 0) {
+            if (p.temperature <= 0.0f || p.top_k <= 0 || p.top_k >= p.n) {
+                int best = 0;
+                float best_v = x[0];
+                for (int i = 1; i < p.n; i++) {
+                    float v = x[i];
+                    if (v > best_v) {
+                        best_v = v;
+                        best = i;
+                    }
+                }
+                out_idx[0] = best;
+                if (dst_codes != nullptr && p.pos >= 0) dst_codes[p.pos] = best;
+                return;
+            }
+
+            int k = p.top_k;
+            if (k > MAX_TOPK) k = MAX_TOPK;
+            int top_idx[MAX_TOPK];
+            float top_val[MAX_TOPK];
+            for (int j = 0; j < k; j++) { top_idx[j] = -1; top_val[j] = -INFINITY; }
+            for (int i = 0; i < p.n; i++) {
+                float v = x[i] / p.temperature;
+                if (v <= top_val[k - 1]) continue;
+                int pos = k - 1;
+                while (pos > 0 && v > top_val[pos - 1]) {
+                    top_val[pos] = top_val[pos - 1];
+                    top_idx[pos] = top_idx[pos - 1];
+                    pos--;
+                }
+                top_val[pos] = v;
+                top_idx[pos] = i;
+            }
+            float max_val = top_val[0];
+            float sum = 0.0f;
+            for (int j = 0; j < k; j++) {
+                if (top_idx[j] < 0) { top_val[j] = 0.0f; continue; }
+                float e = exp(top_val[j] - max_val);
+                top_val[j] = e;
+                sum += e;
+            }
+            int sampled = 0;
+            if (sum > 0.0f) {
+                float r = p.rand_u * sum;
+                float cumsum = 0.0f;
+                for (int j = 0; j < k; j++) {
+                    cumsum += top_val[j];
+                    if (cumsum >= r) {
+                        sampled = (top_idx[j] >= 0) ? top_idx[j] : 0;
+                        break;
+                    }
+                }
+            } else {
+                sampled = (top_idx[0] >= 0) ? top_idx[0] : 0;
+            }
+            out_idx[0] = sampled;
+            if (dst_codes != nullptr && p.pos >= 0) dst_codes[p.pos] = sampled;
+        }
+        return;
+    }
+
+    if (p.temperature <= 0.0f || p.top_k <= 0 || p.top_k >= p.n) {
+        threadgroup float red_val[MAX_TG];
+        threadgroup int red_idx[MAX_TG];
+        float local_best = -INFINITY;
+        int local_idx = 0;
+        for (int i = (int)tid; i < p.n; i += (int)tg_size) {
+            float v = x[i];
+            if (v > local_best || (v == local_best && i < local_idx)) {
+                local_best = v;
+                local_idx = i;
+            }
+        }
+        red_val[tid] = local_best;
+        red_idx[tid] = local_idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float v0 = red_val[tid];
+                int i0 = red_idx[tid];
+                float v1 = red_val[tid + s];
+                int i1 = red_idx[tid + s];
+                if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                    red_val[tid] = v1;
+                    red_idx[tid] = i1;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tid == 0) {
+            int best = red_idx[0];
+            out_idx[0] = best;
+            if (dst_codes != nullptr && p.pos >= 0) dst_codes[p.pos] = best;
+        }
+        return;
+    }
+
+    int k = p.top_k;
+    if (k > MAX_TOPK) k = MAX_TOPK;
+
+    threadgroup uint selected_bits[MAX_MASK_WORDS];
+    threadgroup float red_val[MAX_TG];
+    threadgroup int red_idx[MAX_TG];
+    threadgroup int top_idx[MAX_TOPK];
+    threadgroup float top_val[MAX_TOPK];
+    int words = (p.n + 31) >> 5;
+
+    for (int w = (int)tid; w < words; w += (int)tg_size) selected_bits[w] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_temp = 1.0f / p.temperature;
+
+    for (int j = 0; j < k; j++) {
+        float local_best = -INFINITY;
+        int local_idx = -1;
+        for (int i = (int)tid; i < p.n; i += (int)tg_size) {
+            uint mask = 1u << (uint)(i & 31);
+            if ((selected_bits[i >> 5] & mask) != 0u) continue;
+            float v = x[i] * inv_temp;
+            if (v > local_best || (v == local_best && i < local_idx)) {
+                local_best = v;
+                local_idx = i;
+            }
+        }
+
+        red_val[tid] = local_best;
+        red_idx[tid] = local_idx;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint s = tg_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                float v0 = red_val[tid];
+                int i0 = red_idx[tid];
+                float v1 = red_val[tid + s];
+                int i1 = red_idx[tid + s];
+                if (v1 > v0 || (v1 == v0 && i1 < i0)) {
+                    red_val[tid] = v1;
+                    red_idx[tid] = i1;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (tid == 0) {
+            top_val[j] = red_val[0];
+            top_idx[j] = red_idx[0];
+            if (top_idx[j] >= 0) {
+                uint mask = 1u << (uint)(top_idx[j] & 31);
+                selected_bits[top_idx[j] >> 5] |= mask;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        float max_val = top_val[0];
+        float sum = 0.0f;
+        for (int j = 0; j < k; j++) {
+            if (top_idx[j] < 0) {
+                top_val[j] = 0.0f;
+                continue;
+            }
+            float e = exp(top_val[j] - max_val);
+            top_val[j] = e;
+            sum += e;
+        }
+        int sampled = 0;
+        if (sum > 0.0f) {
+            float r = p.rand_u * sum;
+            float cumsum = 0.0f;
+            for (int j = 0; j < k; j++) {
+                cumsum += top_val[j];
+                if (cumsum >= r) {
+                    sampled = (top_idx[j] >= 0) ? top_idx[j] : 0;
+                    break;
+                }
+            }
+        } else {
+            sampled = (top_idx[0] >= 0) ? top_idx[0] : 0;
+        }
+        out_idx[0] = sampled;
+        if (dst_codes != nullptr && p.pos >= 0) {
+            dst_codes[p.pos] = sampled;
+        }
     }
 }
 

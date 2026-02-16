@@ -204,6 +204,10 @@ void metal_transposed_conv1d(metal_buf_t out, metal_buf_t input, metal_buf_t wei
 void metal_bf16_to_f32(metal_buf_t out, metal_buf_t in_buf, int n);
 void metal_bf16_row_to_f32(metal_buf_t out, metal_buf_t in_buf, int row_idx, int row_size);
 void metal_argmax_i32(metal_buf_t out_idx, metal_buf_t x, int n);
+void metal_sample_topk_i32(metal_buf_t out_idx, metal_buf_t x, int n,
+                           int top_k, float temperature, float rand_u);
+void metal_sample_topk_scatter_i32(metal_buf_t out_idx, metal_buf_t x, metal_buf_t dst_codes, int dst_idx,
+                                   int n, int top_k, float temperature, float rand_u);
 
 /* --- SwiGLU fused --- */
 

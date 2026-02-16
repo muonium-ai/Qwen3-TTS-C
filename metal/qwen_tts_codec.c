@@ -42,6 +42,18 @@ static int should_use_metal_codec_vocoder(void) {
     }
     return enabled;
 }
+
+/* Hybrid vocoder: GPU SnakeBeta + CPU BLAS conv1d. Disabled by default (sync overhead > SnakeBeta savings). */
+static int should_use_hybrid_vocoder(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("QWEN_TTS_HYBRID_VOCODER");
+        if (env) enabled = atoi(env);
+        initialized = 1;
+    }
+    return enabled;
+}
 #endif
 
 static int codec_decoder_weights_ready(const qwen_tts_ctx_t *ctx) {
@@ -831,6 +843,33 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
 }
 
 #ifdef USE_METAL
+/* Check if SnakeBeta parameters (alpha/beta) are uploaded to Metal - needed for hybrid vocoder */
+static int codec_vocoder_snake_params_ready_metal(const qwen_tts_ctx_t *ctx) {
+    const qwen_tts_codec_decoder_t *codec = &ctx->codec;
+    if (!metal_is_available()) return 0;
+    if (codec->mtl_vocoder_final_act_alpha == METAL_BUF_INVALID ||
+        codec->mtl_vocoder_final_act_beta == METAL_BUF_INVALID) {
+        return 0;
+    }
+    for (int b = 0; b < 4; b++) {
+        const qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
+        if (vb->mtl_act_alpha == METAL_BUF_INVALID ||
+            vb->mtl_act_beta == METAL_BUF_INVALID) {
+            return 0;
+        }
+        for (int r = 0; r < 3; r++) {
+            const qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+            if (ru->mtl_act1_alpha == METAL_BUF_INVALID ||
+                ru->mtl_act1_beta == METAL_BUF_INVALID ||
+                ru->mtl_act2_alpha == METAL_BUF_INVALID ||
+                ru->mtl_act2_beta == METAL_BUF_INVALID) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
 static int codec_vocoder_weights_ready_metal(const qwen_tts_ctx_t *ctx) {
     const qwen_tts_codec_decoder_t *codec = &ctx->codec;
     if (!metal_is_available()) return 0;
@@ -866,6 +905,153 @@ static int codec_vocoder_weights_ready_metal(const qwen_tts_ctx_t *ctx) {
         }
     }
     return 1;
+}
+
+/* Hybrid GPU/CPU vocoder: GPU for SnakeBeta (hardware sin), CPU BLAS for conv1d.
+ * Uses Metal shared buffers so both GPU and CPU access the same physical memory. */
+static float *codec_vocoder_forward_hybrid(qwen_tts_ctx_t *ctx, const float *hidden,
+                                           int latent_dim, int length, int *out_samples) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    qwen_tts_codec_decoder_t *codec = &ctx->codec;
+    int decoder_dim = cfg->codec_decoder_dim;
+    int current_dim = decoder_dim;
+    int current_len = length;
+
+    /* Allocate main working buffer as Metal shared memory */
+    size_t voc_size = (size_t)decoder_dim * current_len * sizeof(float);
+    metal_buf_t mtl_voc = metal_buf_create_empty(voc_size);
+    if (mtl_voc == METAL_BUF_INVALID) return NULL;
+    float *voc = (float *)metal_buf_contents(mtl_voc);
+
+    /* Pre-conv on CPU (small: latent_dim=1024, decoder_dim=1536, len=160) */
+    if (codec->vocoder_pre_conv_weight_packed) {
+        kernel_causal_conv1d_packed(voc, hidden, codec->vocoder_pre_conv_weight_packed,
+                                     codec->vocoder_pre_conv_bias,
+                                     latent_dim, decoder_dim, 7, current_len, 1);
+    } else {
+        kernel_causal_conv1d(voc, hidden, codec->vocoder_pre_conv_weight,
+                             codec->vocoder_pre_conv_bias,
+                             latent_dim, decoder_dim, 7, current_len, 1, 1);
+    }
+
+    /* Scratch buffers for resunits (reused, grow as needed) */
+    metal_buf_t mtl_res = METAL_BUF_INVALID;
+    metal_buf_t mtl_conv1 = METAL_BUF_INVALID;
+    float *res_ptr = NULL;
+    float *conv1_ptr = NULL;
+
+    int upsample_rates[4] = {
+        cfg->codec_upsample_rates[0], cfg->codec_upsample_rates[1],
+        cfg->codec_upsample_rates[2], cfg->codec_upsample_rates[3],
+    };
+
+    for (int block = 0; block < 4; block++) {
+        int in_dim = current_dim;
+        int out_dim = in_dim / 2;
+        int rate = upsample_rates[block];
+        int kernel = 2 * rate;
+        qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[block];
+
+        /* SnakeBeta on GPU (hardware sin) */
+        metal_begin();
+        metal_snake_beta(mtl_voc, mtl_voc, vb->mtl_act_alpha, vb->mtl_act_beta, in_dim, current_len);
+        metal_sync();
+
+        /* TransposedConv1d on CPU */
+        int new_len;
+        size_t tc_size = (size_t)out_dim * (current_len * rate + kernel) * sizeof(float);
+        metal_buf_t mtl_tc = metal_buf_create_empty(tc_size);
+        if (mtl_tc == METAL_BUF_INVALID) goto fail;
+        float *tc_ptr = (float *)metal_buf_contents(mtl_tc);
+        if (vb->transconv_weight_packed) {
+            kernel_transposed_conv1d_packed(tc_ptr, voc, vb->transconv_weight_packed, vb->transconv_bias,
+                                            in_dim, out_dim, kernel, rate, current_len, &new_len);
+        } else {
+            kernel_transposed_conv1d(tc_ptr, voc, vb->transconv_weight, vb->transconv_bias,
+                                      in_dim, out_dim, kernel, rate, current_len, &new_len);
+        }
+        metal_buf_release(mtl_voc);
+        mtl_voc = mtl_tc;
+        voc = tc_ptr;
+        current_len = new_len;
+        current_dim = out_dim;
+
+        /* Ensure scratch buffers for resunits */
+        size_t n = (size_t)current_dim * current_len;
+        size_t n_bytes = n * sizeof(float);
+        mtl_res = metal_buf_ensure(mtl_res, n_bytes);
+        mtl_conv1 = metal_buf_ensure(mtl_conv1, n_bytes);
+        if (mtl_res == METAL_BUF_INVALID || mtl_conv1 == METAL_BUF_INVALID) goto fail;
+        res_ptr = (float *)metal_buf_contents(mtl_res);
+        conv1_ptr = (float *)metal_buf_contents(mtl_conv1);
+
+        int dilations[3] = {1, 3, 9};
+        for (int r = 0; r < 3; r++) {
+            qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+
+            /* Save residual (CPU memcpy) */
+            memcpy(res_ptr, voc, n_bytes);
+
+            /* SnakeBeta 1 on GPU */
+            metal_begin();
+            metal_snake_beta(mtl_voc, mtl_voc, ru->mtl_act1_alpha, ru->mtl_act1_beta, current_dim, current_len);
+            metal_sync();
+
+            /* Conv1 (k=7, dilation) on CPU */
+            if (ru->conv1_weight_packed) {
+                kernel_causal_conv1d_packed(conv1_ptr, voc, ru->conv1_weight_packed, ru->conv1_bias,
+                                             current_dim, current_dim, 7, current_len, dilations[r]);
+            } else {
+                kernel_causal_conv1d(conv1_ptr, voc, ru->conv1_weight, ru->conv1_bias,
+                                     current_dim, current_dim, 7, current_len, dilations[r], 1);
+            }
+
+            /* SnakeBeta 2 on GPU (conv1_out → conv1_out) */
+            metal_begin();
+            metal_snake_beta(mtl_conv1, mtl_conv1, ru->mtl_act2_alpha, ru->mtl_act2_beta, current_dim, current_len);
+            metal_sync();
+
+            /* Conv2 (k=1) on CPU */
+            kernel_causal_conv1d(voc, conv1_ptr, ru->conv2_weight, ru->conv2_bias,
+                                 current_dim, current_dim, 1, current_len, 1, 1);
+
+            /* Residual add (CPU) */
+            kernel_add_inplace(voc, res_ptr, (int)n);
+        }
+    }
+
+    /* Final SnakeBeta on GPU */
+    metal_begin();
+    metal_snake_beta(mtl_voc, mtl_voc, codec->mtl_vocoder_final_act_alpha,
+                     codec->mtl_vocoder_final_act_beta, current_dim, current_len);
+    metal_sync();
+
+    /* Final conv on CPU */
+    float *wav = (float *)malloc((size_t)current_len * sizeof(float));
+    if (!wav) goto fail;
+    if (codec->vocoder_final_conv_weight_packed) {
+        kernel_causal_conv1d_packed(wav, voc, codec->vocoder_final_conv_weight_packed,
+                                     codec->vocoder_final_conv_bias,
+                                     current_dim, 1, 7, current_len, 1);
+    } else {
+        kernel_causal_conv1d(wav, voc, codec->vocoder_final_conv_weight,
+                             codec->vocoder_final_conv_bias,
+                             current_dim, 1, 7, current_len, 1, 1);
+    }
+    kernel_clamp(wav, current_len, -1.0f, 1.0f);
+    *out_samples = current_len;
+
+    metal_buf_release(mtl_voc);
+    metal_buf_release(mtl_res);
+    metal_buf_release(mtl_conv1);
+    return wav;
+
+fail:
+    metal_buf_release(mtl_voc);
+    metal_buf_release(mtl_res);
+    metal_buf_release(mtl_conv1);
+    *out_samples = 0;
+    return NULL;
 }
 
 static float *codec_vocoder_forward_metal(qwen_tts_ctx_t *ctx, const float *hidden,
@@ -1062,6 +1248,14 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
 #ifdef USE_METAL
     if (should_use_metal_codec_vocoder() && codec_vocoder_weights_ready_metal(ctx)) {
         wav = codec_vocoder_forward_metal(ctx, hidden, latent_dim, current_len, out_samples);
+        if (wav) {
+            stage_vocoder_ms = now_ms() - stage_t0;
+            current_len = *out_samples;
+            free(hidden);
+        }
+    }
+    if (!wav && should_use_hybrid_vocoder() && codec_vocoder_snake_params_ready_metal(ctx)) {
+        wav = codec_vocoder_forward_hybrid(ctx, hidden, latent_dim, current_len, out_samples);
         if (wav) {
             stage_vocoder_ms = now_ms() - stage_t0;
             current_len = *out_samples;

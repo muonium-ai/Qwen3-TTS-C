@@ -17,6 +17,7 @@
 #include "qwen_tts.h"
 #include "qwen_tts_kernels.h"
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -113,10 +114,55 @@ static void compute_mrope_pos(float *cos_out, float *sin_out,
     }
 }
 
+static int ensure_talker_mrope_cache(qwen_tts_ctx_t *ctx, int needed_pos) {
+    qwen_tts_config_t *cfg = &ctx->config;
+    int head_dim = cfg->talker_head_dim;
+    int old_cap = ctx->talker_rope_cache_cap;
+    if (needed_pos <= old_cap) return 0;
+
+    size_t total = (size_t)needed_pos * 3 * head_dim;
+    float *cos_new = (float *)malloc(total * sizeof(float));
+    float *sin_new = (float *)malloc(total * sizeof(float));
+    if (!cos_new || !sin_new) {
+        free(cos_new);
+        free(sin_new);
+        return -1;
+    }
+
+    if (ctx->talker_rope_cos_cache && ctx->talker_rope_sin_cache && old_cap > 0) {
+        size_t copy = (size_t)old_cap * 3 * head_dim;
+        memcpy(cos_new, ctx->talker_rope_cos_cache, copy * sizeof(float));
+        memcpy(sin_new, ctx->talker_rope_sin_cache, copy * sizeof(float));
+    }
+
+    for (int p = old_cap; p < needed_pos; p++) {
+        compute_mrope_pos(cos_new + (size_t)p * 3 * head_dim,
+                          sin_new + (size_t)p * 3 * head_dim,
+                          p, head_dim, cfg->talker_rope_theta);
+    }
+
+    free(ctx->talker_rope_cos_cache);
+    free(ctx->talker_rope_sin_cache);
+    ctx->talker_rope_cos_cache = cos_new;
+    ctx->talker_rope_sin_cache = sin_new;
+    ctx->talker_rope_cache_cap = needed_pos;
+    return 0;
+}
+
 static double talker_now_ms(void) {
     struct timespec ts;
     timespec_get(&ts, TIME_UTC);
     return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+static float talker_rand_uniform(float *state) {
+    uint32_t s;
+    memcpy(&s, state, sizeof(uint32_t));
+    s ^= s << 13;
+    s ^= s >> 17;
+    s ^= s << 5;
+    memcpy(state, &s, sizeof(uint32_t));
+    return (float)(s & 0x7FFFFFFF) / (float)0x7FFFFFFF;
 }
 
 static int should_trace_layers(void) {
@@ -292,6 +338,17 @@ static int should_use_metal_subtalker(void) {
         } else {
             enabled = should_use_metal_talker();
         }
+        initialized = 1;
+    }
+    return enabled;
+}
+
+static int should_use_metal_subtalker_stochastic_fused(void) {
+    static int initialized = 0;
+    static int enabled = 0;
+    if (!initialized) {
+        const char *env = getenv("QWEN_TTS_METAL_SUBTALKER_STOCHASTIC_FUSED");
+        enabled = (env && atoi(env) != 0) ? 1 : 0;
         initialized = 1;
     }
     return enabled;
@@ -726,28 +783,11 @@ void qwen_tts_talker_prefill(qwen_tts_ctx_t *ctx, const float *input_embeds, int
     /* Copy input embeddings */
     memcpy(x, input_embeds, (size_t)seq_len * hidden * sizeof(float));
 
-    /* Compute/cached M-RoPE cos/sin for all positions */
-    if (!ctx->talker_rope_cos_cache || !ctx->talker_rope_sin_cache || ctx->talker_rope_cache_cap < seq_len) {
-        size_t rope_size = (size_t)seq_len * 3 * head_dim;
-        float *cos_new = (float *)malloc(rope_size * sizeof(float));
-        float *sin_new = (float *)malloc(rope_size * sizeof(float));
-        if (!cos_new || !sin_new) {
-            free(cos_new);
-            free(sin_new);
-            free(scores);
-            fprintf(stderr, "Error: failed to allocate talker M-RoPE cache\n");
-            return;
-        }
-        free(ctx->talker_rope_cos_cache);
-        free(ctx->talker_rope_sin_cache);
-        ctx->talker_rope_cos_cache = cos_new;
-        ctx->talker_rope_sin_cache = sin_new;
-        for (int p = 0; p < seq_len; p++) {
-            compute_mrope_pos(ctx->talker_rope_cos_cache + (size_t)p * 3 * head_dim,
-                              ctx->talker_rope_sin_cache + (size_t)p * 3 * head_dim,
-                              p, head_dim, cfg->talker_rope_theta);
-        }
-        ctx->talker_rope_cache_cap = seq_len;
+    /* Compute/cache M-RoPE cos/sin for all positions. */
+    if (ensure_talker_mrope_cache(ctx, seq_len) != 0) {
+        free(scores);
+        fprintf(stderr, "Error: failed to allocate talker M-RoPE cache\n");
+        return;
     }
     float *cos_all = ctx->talker_rope_cos_cache;
     float *sin_all = ctx->talker_rope_sin_cache;
@@ -966,9 +1006,16 @@ void qwen_tts_talker_forward(qwen_tts_ctx_t *ctx, const float *input_embed, floa
 #endif
     memcpy(x, input_embed, hidden * sizeof(float));
 
-    /* Compute M-RoPE cos/sin for this position */
-    float cos_mrope[3 * 512], sin_mrope[3 * 512];
-    compute_mrope_pos(cos_mrope, sin_mrope, pos, head_dim, cfg->talker_rope_theta);
+    /* Reuse cached M-RoPE for this position (fallback to stack on OOM). */
+    float cos_mrope_stack[3 * 512], sin_mrope_stack[3 * 512];
+    const float *cos_mrope = cos_mrope_stack;
+    const float *sin_mrope = sin_mrope_stack;
+    if (ensure_talker_mrope_cache(ctx, pos + 1) == 0) {
+        cos_mrope = ctx->talker_rope_cos_cache + (size_t)pos * 3 * head_dim;
+        sin_mrope = ctx->talker_rope_sin_cache + (size_t)pos * 3 * head_dim;
+    } else {
+        compute_mrope_pos(cos_mrope_stack, sin_mrope_stack, pos, head_dim, cfg->talker_rope_theta);
+    }
 
 #ifdef USE_METAL
     if (use_metal_talker) {
@@ -1319,6 +1366,82 @@ void qwen_tts_subtalker_generate(
             return;
         }
 
+        /* ---- FUSED STOCHASTIC GPU PATH (experimental, env-gated) ----
+         * Keeps subtalker decode + top-k sampling on GPU and syncs once.
+         * Enabled via QWEN_TTS_METAL_SUBTALKER_STOCHASTIC_FUSED=1. */
+        {
+            int use_stochastic_fused = should_use_metal_subtalker_stochastic_fused() &&
+                                       !deterministic_subtalker &&
+                                       num_groups > 1 &&
+                                       ctx->subtalker_top_p >= 1.0f &&
+                                       ctx->subtalker_top_k > 1 &&
+                                       ctx->subtalker_top_k <= 256 &&
+                                       ctx->subtalker_top_k < st_vocab &&
+                                       ctx->subtalker_temperature > 0.0f &&
+                                       ctx->talker.mtl_codec_embedding != METAL_BUF_INVALID;
+            size_t rope_bytes = 0;
+
+                if (use_stochastic_fused) {
+                    rope_bytes = (size_t)max_seq * st_head_dim * sizeof(float);
+                    size_t old_rope_cos = metal_buf_size(ctx->mtl_sub_rope_cos_all);
+                    size_t old_rope_sin = metal_buf_size(ctx->mtl_sub_rope_sin_all);
+                    ctx->mtl_sub_codes = metal_buf_ensure(ctx->mtl_sub_codes, num_groups * sizeof(int));
+                    ctx->mtl_sub_rope_cos_all = metal_buf_ensure(ctx->mtl_sub_rope_cos_all, rope_bytes);
+                    ctx->mtl_sub_rope_sin_all = metal_buf_ensure(ctx->mtl_sub_rope_sin_all, rope_bytes);
+                    if (ctx->mtl_sub_codes == METAL_BUF_INVALID ||
+                        ctx->mtl_sub_rope_cos_all == METAL_BUF_INVALID ||
+                        ctx->mtl_sub_rope_sin_all == METAL_BUF_INVALID) {
+                        use_stochastic_fused = 0;
+                    } else if (old_rope_cos < rope_bytes || old_rope_sin < rope_bytes) {
+                        metal_buf_write(ctx->mtl_sub_rope_cos_all, ctx->st_rope_cos, rope_bytes);
+                        metal_buf_write(ctx->mtl_sub_rope_sin_all, ctx->st_rope_sin, rope_bytes);
+                    }
+                }
+            if (use_stochastic_fused) {
+                float *sub_embed_ptr = (float *)metal_buf_contents(ctx->mtl_sub_embed);
+                if (!sub_embed_ptr) use_stochastic_fused = 0;
+            }
+            if (use_stochastic_fused) {
+                /* Step 0: prefill with projected talker hidden, no logits. */
+                float *sub_embed_ptr = (float *)metal_buf_contents(ctx->mtl_sub_embed);
+                memcpy(sub_embed_ptr, talker_hidden, (size_t)talker_hidden_dim * sizeof(float));
+                subtalker_forward_step_fused(ctx, ctx->mtl_sub_embed, talker_hidden_dim, 0,
+                                             METAL_BUF_INVALID, st_vocab,
+                                             ctx->mtl_sub_rope_cos_all, ctx->mtl_sub_rope_sin_all);
+
+                /* Step 1: talker codec embedding -> lm_head[0] -> sampled token. */
+                metal_bf16_row_to_f32(ctx->mtl_sub_embed, ctx->talker.mtl_codec_embedding,
+                                      first_code, talker_hidden_dim);
+                subtalker_forward_step_fused(ctx, ctx->mtl_sub_embed, talker_hidden_dim, 1,
+                                             ctx->subtalker.mtl_lm_heads[0], st_vocab,
+                                             ctx->mtl_sub_rope_cos_all, ctx->mtl_sub_rope_sin_all);
+                metal_sample_topk_scatter_i32(ctx->mtl_sub_token, ctx->mtl_logits, ctx->mtl_sub_codes, 1,
+                                              st_vocab, ctx->subtalker_top_k, ctx->subtalker_temperature,
+                                              talker_rand_uniform(&rng));
+
+                /* Steps 2..31: sampled-token embedding -> lm_head[g-1] -> sample. */
+                for (int g = 2; g < num_groups; g++) {
+                    metal_embed_from_argmax_bf16(ctx->mtl_sub_embed,
+                                                 ctx->subtalker.mtl_codec_embeddings[g - 2],
+                                                 ctx->mtl_sub_token, talker_hidden_dim);
+                    subtalker_forward_step_fused(ctx, ctx->mtl_sub_embed, talker_hidden_dim, g,
+                                                 ctx->subtalker.mtl_lm_heads[g - 1], st_vocab,
+                                                 ctx->mtl_sub_rope_cos_all, ctx->mtl_sub_rope_sin_all);
+                    metal_sample_topk_scatter_i32(ctx->mtl_sub_token, ctx->mtl_logits, ctx->mtl_sub_codes, g,
+                                                  st_vocab, ctx->subtalker_top_k, ctx->subtalker_temperature,
+                                                  talker_rand_uniform(&rng));
+                }
+
+                metal_sync();
+                int *codes_gpu = (int *)metal_buf_contents(ctx->mtl_sub_codes);
+                for (int g = 1; g < num_groups; g++) {
+                    out_codes[g] = codes_gpu[g];
+                }
+                memcpy(x, metal_buf_contents(ctx->mtl_x), st_hidden * sizeof(float));
+                return;
+            }
+        }
+
         /* ---- NON-FUSED PATH (stochastic sampling or single group) ---- */
         subtalker_forward_step_metal(ctx, talker_hidden, METAL_BUF_INVALID, talker_hidden_dim, 0,
                                      METAL_BUF_INVALID, st_vocab, NULL, 1);
@@ -1328,7 +1451,8 @@ void qwen_tts_subtalker_generate(
             kernel_bf16_to_f32(embed_buf, emb + (size_t)first_code * talker_hidden_dim, talker_hidden_dim);
             subtalker_forward_step_metal(ctx, embed_buf, METAL_BUF_INVALID, talker_hidden_dim, 1,
                                          ctx->subtalker.mtl_lm_heads[0], st_vocab, logits_buf, 1);
-            out_codes[1] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
+            out_codes[1] = kernel_sample_top_k(logits_buf,
+                                               st_vocab, ctx->subtalker_top_k,
                                                ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
         }
 
@@ -1337,7 +1461,8 @@ void qwen_tts_subtalker_generate(
                                (size_t)out_codes[g - 1] * talker_hidden_dim, talker_hidden_dim);
             subtalker_forward_step_metal(ctx, embed_buf, METAL_BUF_INVALID, talker_hidden_dim, g,
                                          ctx->subtalker.mtl_lm_heads[g - 1], st_vocab, logits_buf, 1);
-            out_codes[g] = kernel_sample_top_k(logits_buf, st_vocab, ctx->subtalker_top_k,
+            out_codes[g] = kernel_sample_top_k(logits_buf,
+                                               st_vocab, ctx->subtalker_top_k,
                                                ctx->subtalker_top_p, ctx->subtalker_temperature, &rng);
         }
 

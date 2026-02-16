@@ -41,3 +41,4 @@ model/
 test/*.wav
 metal/output.wav
 .claude/settings.local.json
+output.wav
