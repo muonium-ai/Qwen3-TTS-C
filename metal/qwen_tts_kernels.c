@@ -91,7 +91,43 @@ static float *conv1d_wpack_get(size_t n) {
     }
     return _conv1d_wpack;
 }
+
 #endif
+
+/* Pre-pack conv1d weights from [out, in, k] to [k, out, in] layout.
+ * Returns newly allocated buffer, or NULL on failure. */
+float *kernel_prepack_conv1d(const float *weight, int out_channels, int in_channels, int kernel_size) {
+    size_t n = (size_t)kernel_size * out_channels * in_channels;
+    float *packed = (float *)malloc(n * sizeof(float));
+    if (!packed) return NULL;
+    for (int k = 0; k < kernel_size; k++) {
+        float *wk = packed + (size_t)k * out_channels * in_channels;
+        for (int oc = 0; oc < out_channels; oc++) {
+            const float *src = weight + (size_t)oc * in_channels * kernel_size + k;
+            float *dst = wk + (size_t)oc * in_channels;
+            for (int ic = 0; ic < in_channels; ic++) {
+                dst[ic] = src[(size_t)ic * kernel_size];
+            }
+        }
+    }
+    return packed;
+}
+
+/* Pre-pack transposed conv1d weights from [in, out, k] to [k, out, in] layout. */
+float *kernel_prepack_transposed_conv1d(const float *weight, int in_channels, int out_channels, int kernel_size) {
+    size_t n = (size_t)kernel_size * out_channels * in_channels;
+    float *packed = (float *)malloc(n * sizeof(float));
+    if (!packed) return NULL;
+    for (int k = 0; k < kernel_size; k++) {
+        for (int oc = 0; oc < out_channels; oc++) {
+            for (int ic = 0; ic < in_channels; ic++) {
+                packed[(size_t)k * out_channels * in_channels + (size_t)oc * in_channels + ic] =
+                    weight[(size_t)ic * out_channels * kernel_size + (size_t)oc * kernel_size + k];
+            }
+        }
+    }
+    return packed;
+}
 
 void kernel_matvec_bf16(float *out, const uint16_t *A_bf16, const float *x, int rows, int cols) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
@@ -257,7 +293,7 @@ void kernel_snake_beta(float *out, const float *x, const float *alpha,
      *   beta = 1 / (exp(beta_log) + eps)
      */
 #if defined(ACCELERATE_NEW_LAPACK)
-    /* Vectorized path using Accelerate vvsinf + vDSP (4-8x faster than scalar sinf) */
+    /* Vectorized path using Accelerate vvsinf + vDSP */
     int L = length;
     vDSP_Length vL = (vDSP_Length)length;
 #ifdef USE_OPENMP
@@ -882,6 +918,158 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
     }
 }
 
+/* Causal Conv1d with pre-packed weights in [k, out, in] layout.
+ * Skips the per-call repacking. Only supports groups=1, kernel>1. */
+void kernel_causal_conv1d_packed(float *out, const float *input, const float *weight_packed,
+                                  const float *bias, int in_channels, int out_channels,
+                                  int kernel_size, int length, int dilation) {
+    int eff_kernel = (kernel_size - 1) * dilation + 1;
+    int pad = eff_kernel - 1;
+
+#ifdef USE_BLAS
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int oc = 0; oc < out_channels; oc++) {
+        float *out_ch = out + (size_t)oc * length;
+        float b = bias ? bias[oc] : 0.0f;
+        for (int t = 0; t < length; t++) out_ch[t] = b;
+    }
+
+    for (int k = 0; k < kernel_size; k++) {
+        int shift = pad - k * dilation;
+        int out_start = shift;
+        int in_start = 0;
+        if (out_start < 0) {
+            in_start = -out_start;
+            out_start = 0;
+        }
+        if (out_start >= length || in_start >= length) continue;
+
+        int n = length - out_start;
+        int n_in = length - in_start;
+        if (n > n_in) n = n_in;
+        if (n <= 0) continue;
+
+        const float *wk = weight_packed + (size_t)k * out_channels * in_channels;
+        const float *in_blk = input + in_start;
+        float *out_blk = out + out_start;
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    out_channels, n, in_channels,
+                    1.0f, wk, in_channels,
+                    in_blk, length,
+                    1.0f, out_blk, length);
+    }
+#else
+    /* Scalar fallback */
+    for (int oc = 0; oc < out_channels; oc++) {
+        float *out_ch = out + (size_t)oc * length;
+        float b = bias ? bias[oc] : 0.0f;
+        for (int t = 0; t < length; t++) out_ch[t] = b;
+    }
+    for (int k = 0; k < kernel_size; k++) {
+        int shift = pad - k * dilation;
+        int out_start = shift;
+        int in_start = 0;
+        if (out_start < 0) { in_start = -out_start; out_start = 0; }
+        if (out_start >= length || in_start >= length) continue;
+        int n = length - out_start;
+        int n_in = length - in_start;
+        if (n > n_in) n = n_in;
+        if (n <= 0) continue;
+        const float *wk = weight_packed + (size_t)k * out_channels * in_channels;
+        const float *in_blk = input + in_start;
+        float *out_blk = out + out_start;
+        for (int oc = 0; oc < out_channels; oc++) {
+            const float *w_row = wk + (size_t)oc * in_channels;
+            for (int i = 0; i < n; i++) {
+                float sum = 0.0f;
+                for (int ic = 0; ic < in_channels; ic++)
+                    sum += w_row[ic] * in_blk[(size_t)ic * length + in_start + i];
+                out_blk[(size_t)oc * length + i] += sum;
+            }
+        }
+    }
+#endif
+}
+
+/* Transposed Conv1d with pre-packed weights in [k, out, in] layout. */
+void kernel_transposed_conv1d_packed(float *out, const float *input, const float *weight_packed,
+                                      const float *bias, int in_channels, int out_channels,
+                                      int kernel_size, int stride, int length, int *out_length) {
+    int raw_out_len = (length - 1) * stride + kernel_size;
+    int right_pad = kernel_size - stride;
+    int final_len = raw_out_len - right_pad;
+    if (final_len < 0) final_len = 0;
+
+#ifdef USE_BLAS
+    {
+        size_t temp_size = (size_t)out_channels * length;
+        float *temp = (float *)malloc(temp_size * sizeof(float));
+        if (temp) {
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+            for (int oc = 0; oc < out_channels; oc++) {
+                float *out_ch = out + (size_t)oc * final_len;
+                float b = bias ? bias[oc] : 0.0f;
+                for (int t = 0; t < final_len; t++) out_ch[t] = b;
+            }
+
+            for (int k = 0; k < kernel_size; k++) {
+                const float *wk = weight_packed + (size_t)k * out_channels * in_channels;
+
+                int n = (final_len - 1 - k) / stride + 1;
+                if (n <= 0) continue;
+                if (n > length) n = length;
+
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            out_channels, n, in_channels,
+                            1.0f, wk, in_channels,
+                            input, length,
+                            0.0f, temp, n);
+
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+                for (int oc = 0; oc < out_channels; oc++) {
+                    const float *tp = temp + (size_t)oc * n;
+                    float *op = out + (size_t)oc * final_len + k;
+                    for (int t = 0; t < n; t++) {
+                        op[t * stride] += tp[t];
+                    }
+                }
+            }
+            free(temp);
+            if (out_length) *out_length = final_len;
+            return;
+        }
+        free(temp);
+    }
+#endif
+
+    /* Scalar fallback */
+#ifdef USE_OPENMP
+#pragma omp parallel for schedule(static)
+#endif
+    for (int oc = 0; oc < out_channels; oc++) {
+        float *out_ch = out + (size_t)oc * final_len;
+        float b = bias ? bias[oc] : 0.0f;
+        for (int t = 0; t < final_len; t++) out_ch[t] = b;
+        for (int ic = 0; ic < in_channels; ic++) {
+            const float *in_ch = input + (size_t)ic * length;
+            for (int k = 0; k < kernel_size; k++) {
+                float wval = weight_packed[(size_t)k * out_channels * in_channels + (size_t)oc * in_channels + ic];
+                for (int t = 0; t < length; t++) {
+                    int ot = t * stride + k;
+                    if (ot < final_len) out_ch[ot] += wval * in_ch[t];
+                }
+            }
+        }
+    }
+    if (out_length) *out_length = final_len;
+}
+
 void kernel_transposed_conv1d(float *out, const float *input, const float *weight,
                               const float *bias, int in_channels, int out_channels,
                               int kernel_size, int stride, int length, int *out_length) {
@@ -995,11 +1183,9 @@ void kernel_transposed_conv1d(float *out, const float *input, const float *weigh
 
 void kernel_init(void) {
 #ifdef USE_METAL
+    /* Metal is enabled by default. Set QWEN_TTS_ENABLE_METAL=0 to disable. */
     const char *enable_env = getenv("QWEN_TTS_ENABLE_METAL");
-    const char *talker_env = getenv("QWEN_TTS_METAL_TALKER");
-    int want_metal = ((enable_env && atoi(enable_env) != 0) ||
-                      (talker_env && atoi(talker_env) != 0));
-    if (!want_metal) return;
+    if (enable_env && atoi(enable_env) == 0) return;
 
     if (metal_init() != 0 && qwen_tts_verbose >= 1) {
         fprintf(stderr, "Metal: initialization failed, using CPU kernels only\n");

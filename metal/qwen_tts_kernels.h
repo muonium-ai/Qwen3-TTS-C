@@ -103,10 +103,26 @@ void kernel_causal_conv1d(float *out, const float *input, const float *weight,
                           const float *bias, int in_channels, int out_channels,
                           int kernel_size, int length, int dilation, int groups);
 
+/* Causal Conv1d with pre-packed weights in [k, out, in] layout (groups=1 only) */
+void kernel_causal_conv1d_packed(float *out, const float *input, const float *weight_packed,
+                                  const float *bias, int in_channels, int out_channels,
+                                  int kernel_size, int length, int dilation);
+
 /* Transposed Conv1d (for upsampling) */
 void kernel_transposed_conv1d(float *out, const float *input, const float *weight,
                               const float *bias, int in_channels, int out_channels,
                               int kernel_size, int stride, int length, int *out_length);
+
+/* Transposed Conv1d with pre-packed weights in [k, out, in] layout */
+void kernel_transposed_conv1d_packed(float *out, const float *input, const float *weight_packed,
+                                      const float *bias, int in_channels, int out_channels,
+                                      int kernel_size, int stride, int length, int *out_length);
+
+/* Pre-pack conv1d weights from [out, in, k] to [k, out, in]. Caller must free result. */
+float *kernel_prepack_conv1d(const float *weight, int out_channels, int in_channels, int kernel_size);
+
+/* Pre-pack transposed conv1d weights from [in, out, k] to [k, out, in]. Caller must free result. */
+float *kernel_prepack_transposed_conv1d(const float *weight, int in_channels, int out_channels, int kernel_size);
 
 /* Clamp values to [-1, 1] */
 void kernel_clamp(float *x, int n, float min_val, float max_val);

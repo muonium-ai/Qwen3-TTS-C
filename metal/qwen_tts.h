@@ -335,6 +335,7 @@ typedef struct {
     float *act1_alpha;             /* [dim] */
     float *act1_beta;              /* [dim] */
     float *conv1_weight;           /* [dim, dim, 7] */
+    float *conv1_weight_packed;    /* [7, dim, dim] pre-packed for BLAS */
     float *conv1_bias;             /* [dim] */
     float *act2_alpha;             /* [dim] */
     float *act2_beta;              /* [dim] */
@@ -353,6 +354,7 @@ typedef struct {
     float *act_alpha;              /* [in_dim] */
     float *act_beta;               /* [in_dim] */
     float *transconv_weight;       /* [in_dim, out_dim, kernel] */
+    float *transconv_weight_packed; /* [kernel, out_dim, in_dim] pre-packed for BLAS */
     float *transconv_bias;         /* [out_dim] */
     qwen_tts_vocoder_resunit_t resunits[3];  /* dilations 1, 3, 9 */
 #ifdef USE_METAL
@@ -384,6 +386,7 @@ typedef struct {
 
     /* Vocoder: initial conv */
     float *vocoder_pre_conv_weight;        /* [decoder_dim, latent, 7] */
+    float *vocoder_pre_conv_weight_packed; /* [7, decoder_dim, latent] pre-packed for BLAS */
     float *vocoder_pre_conv_bias;          /* [decoder_dim] */
 
     /* Vocoder: 4 decoder blocks */
@@ -393,6 +396,7 @@ typedef struct {
     float *vocoder_final_act_alpha;        /* [final_dim] */
     float *vocoder_final_act_beta;         /* [final_dim] */
     float *vocoder_final_conv_weight;      /* [1, final_dim, 7] */
+    float *vocoder_final_conv_weight_packed; /* [7, 1, final_dim] pre-packed for BLAS */
     float *vocoder_final_conv_bias;        /* [1] */
 
 #ifdef USE_METAL

@@ -712,24 +712,50 @@ static void codec_convnext_forward(qwen_tts_convnext_block_t *block,
     for (int t = 0; t < len; t++)
         kernel_layer_norm(x_ld + t * dim, x_ld + t * dim, block->norm_weight, block->norm_bias, dim, 1e-6f);
 
-    /* pwconv1: [dim] → [4*dim] */
+    /* pwconv1: [len, dim] → [len, 4*dim] via batched GEMM */
     int dim4 = 4 * dim;
     float *pw1 = (float *)malloc((size_t)len * dim4 * sizeof(float));
+#ifdef USE_BLAS
+    /* x_ld[len, dim] @ pwconv1_weight[dim4, dim]^T → pw1[len, dim4] */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                len, dim4, dim,
+                1.0f, x_ld, dim,
+                block->pwconv1_weight, dim,
+                0.0f, pw1, dim4);
+    if (block->pwconv1_bias) {
+        for (int t = 0; t < len; t++)
+            kernel_add_inplace(pw1 + t * dim4, block->pwconv1_bias, dim4);
+    }
+#else
     for (int t = 0; t < len; t++) {
         kernel_matvec_f32(pw1 + t * dim4, block->pwconv1_weight, x_ld + t * dim, dim4, dim);
         if (block->pwconv1_bias)
             kernel_add_inplace(pw1 + t * dim4, block->pwconv1_bias, dim4);
     }
+#endif
 
     /* GELU */
     kernel_gelu_inplace(pw1, len * dim4);
 
-    /* pwconv2: [4*dim] → [dim] */
+    /* pwconv2: [len, 4*dim] → [len, dim] via batched GEMM */
+#ifdef USE_BLAS
+    /* pw1[len, dim4] @ pwconv2_weight[dim, dim4]^T → x_ld[len, dim] */
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                len, dim, dim4,
+                1.0f, pw1, dim4,
+                block->pwconv2_weight, dim4,
+                0.0f, x_ld, dim);
+    if (block->pwconv2_bias) {
+        for (int t = 0; t < len; t++)
+            kernel_add_inplace(x_ld + t * dim, block->pwconv2_bias, dim);
+    }
+#else
     for (int t = 0; t < len; t++) {
         kernel_matvec_f32(x_ld + t * dim, block->pwconv2_weight, pw1 + t * dim4, dim, dim4);
         if (block->pwconv2_bias)
             kernel_add_inplace(x_ld + t * dim, block->pwconv2_bias, dim);
     }
+#endif
 
     /* Apply gamma (learnable residual scale) */
     for (int t = 0; t < len; t++)
@@ -784,8 +810,13 @@ static int vocoder_resunit_forward(qwen_tts_vocoder_resunit_t *unit,
     kernel_snake_beta(hidden, hidden, unit->act1_alpha, unit->act1_beta, dim, length);
 
     /* Causal conv1 (k=7, dilation) */
-    kernel_causal_conv1d(conv1_out, hidden, unit->conv1_weight, unit->conv1_bias,
-                         dim, dim, 7, length, dilation, 1);
+    if (unit->conv1_weight_packed) {
+        kernel_causal_conv1d_packed(conv1_out, hidden, unit->conv1_weight_packed, unit->conv1_bias,
+                                     dim, dim, 7, length, dilation);
+    } else {
+        kernel_causal_conv1d(conv1_out, hidden, unit->conv1_weight, unit->conv1_bias,
+                             dim, dim, 7, length, dilation, 1);
+    }
 
     /* SnakeBeta activation 2 (in-place) */
     kernel_snake_beta(conv1_out, conv1_out, unit->act2_alpha, unit->act2_beta, dim, length);
@@ -1043,9 +1074,15 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
         /* 7a. Initial conv: CausalConv1d(latent_dim, decoder_dim, k=7) */
         int decoder_dim = cfg->codec_decoder_dim;
         float *voc = (float *)malloc((size_t)decoder_dim * current_len * sizeof(float));
-        kernel_causal_conv1d(voc, hidden, ctx->codec.vocoder_pre_conv_weight,
-                             ctx->codec.vocoder_pre_conv_bias,
-                             latent_dim, decoder_dim, 7, current_len, 1, 1);
+        if (ctx->codec.vocoder_pre_conv_weight_packed) {
+            kernel_causal_conv1d_packed(voc, hidden, ctx->codec.vocoder_pre_conv_weight_packed,
+                                         ctx->codec.vocoder_pre_conv_bias,
+                                         latent_dim, decoder_dim, 7, current_len, 1);
+        } else {
+            kernel_causal_conv1d(voc, hidden, ctx->codec.vocoder_pre_conv_weight,
+                                 ctx->codec.vocoder_pre_conv_bias,
+                                 latent_dim, decoder_dim, 7, current_len, 1, 1);
+        }
         free(hidden);
 
         /* 7b. 4 decoder blocks: SnakeBeta → TransConv → 3 ResUnits */
@@ -1071,8 +1108,13 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
             int new_len;
             int kernel = 2 * rate;
             float *transconv_out = (float *)malloc((size_t)out_dim * (current_len * rate + kernel) * sizeof(float));
-            kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
-                                      in_dim, out_dim, kernel, rate, current_len, &new_len);
+            if (vb->transconv_weight_packed) {
+                kernel_transposed_conv1d_packed(transconv_out, voc, vb->transconv_weight_packed, vb->transconv_bias,
+                                                in_dim, out_dim, kernel, rate, current_len, &new_len);
+            } else {
+                kernel_transposed_conv1d(transconv_out, voc, vb->transconv_weight, vb->transconv_bias,
+                                          in_dim, out_dim, kernel, rate, current_len, &new_len);
+            }
             free(voc);
 
             voc = (float *)realloc(transconv_out, (size_t)out_dim * new_len * sizeof(float));
@@ -1099,9 +1141,15 @@ float *qwen_tts_codec_decode(qwen_tts_ctx_t *ctx, const int *codes,
 
         /* Final conv: [current_dim, current_len] → [1, current_len] */
         wav = (float *)malloc((size_t)current_len * sizeof(float));
-        kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
-                             ctx->codec.vocoder_final_conv_bias,
-                             current_dim, 1, 7, current_len, 1, 1);
+        if (ctx->codec.vocoder_final_conv_weight_packed) {
+            kernel_causal_conv1d_packed(wav, voc, ctx->codec.vocoder_final_conv_weight_packed,
+                                         ctx->codec.vocoder_final_conv_bias,
+                                         current_dim, 1, 7, current_len, 1);
+        } else {
+            kernel_causal_conv1d(wav, voc, ctx->codec.vocoder_final_conv_weight,
+                                 ctx->codec.vocoder_final_conv_bias,
+                                 current_dim, 1, 7, current_len, 1, 1);
+        }
         free(voc);
         free(ru_scratch.residual);
         free(ru_scratch.conv1_out);

@@ -767,6 +767,39 @@ static void load_codec_weights(qwen_tts_ctx_t *ctx, const multi_safetensors_t *m
     LOAD_F32_CHECK(codec->vocoder_final_conv_weight, ms, "decoder.decoder.6.conv.weight");
     LOAD_F32_CHECK(codec->vocoder_final_conv_bias, ms, "decoder.decoder.6.conv.bias");
 
+    /* Pre-pack convolution weights for BLAS fast path (avoids per-call repacking) */
+    {
+        int latent = cfg->codec_latent;
+        int decoder_dim = cfg->codec_decoder_dim;
+
+        /* Pre-conv: [decoder_dim, latent, 7] → [7, decoder_dim, latent] */
+        codec->vocoder_pre_conv_weight_packed =
+            kernel_prepack_conv1d(codec->vocoder_pre_conv_weight, decoder_dim, latent, 7);
+
+        /* Final conv: [1, final_dim, 7] → [7, 1, final_dim] */
+        int final_dim = decoder_dim / 16;
+        codec->vocoder_final_conv_weight_packed =
+            kernel_prepack_conv1d(codec->vocoder_final_conv_weight, 1, final_dim, 7);
+
+        for (int b = 0; b < 4; b++) {
+            qwen_tts_vocoder_block_t *vb = &codec->vocoder_blocks[b];
+            int in_dim = decoder_dim >> b;
+            int out_dim = in_dim / 2;
+            int rate = cfg->codec_upsample_rates[b];
+
+            /* TransConv: [in_dim, out_dim, 2*rate] → [2*rate, out_dim, in_dim] */
+            vb->transconv_weight_packed =
+                kernel_prepack_transposed_conv1d(vb->transconv_weight, in_dim, out_dim, 2 * rate);
+
+            for (int r = 0; r < 3; r++) {
+                qwen_tts_vocoder_resunit_t *ru = &vb->resunits[r];
+                /* Conv1: [out_dim, out_dim, 7] → [7, out_dim, out_dim] */
+                ru->conv1_weight_packed =
+                    kernel_prepack_conv1d(ru->conv1_weight, out_dim, out_dim, 7);
+            }
+        }
+    }
+
     if (qwen_tts_verbose >= 1) fprintf(stderr, "  Codec decoder loaded\n");
 }
 
