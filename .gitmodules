@@ -1,3 +1,6 @@
 [submodule "vendor/emsdk"]
 	path = vendor/emsdk
 	url = https://github.com/emscripten-core/emsdk.git
+[submodule "tickets/mt/muontickets"]
+	path = tickets/mt/muontickets
+	url = https://github.com/muonium-ai/muontickets.git
